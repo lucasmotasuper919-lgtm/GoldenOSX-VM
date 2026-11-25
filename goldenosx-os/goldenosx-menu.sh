@@ -101,16 +101,20 @@ while true; do
     read -rp "Escolha uma opcao [0-9, u]: " opt
     case "$opt" in
         u|U)
-            WIN_DL=$(ls -d /mnt/disks/*/Users/*/Downloads 2>/dev/null | head -n 1 || true)
+            FOUND_FILE=$(ls /mnt/disks/*/Users/*/Downloads/goldenosx-launch.sh /mnt/disks/*/Users/*/Downloads/stela-vgpu-daemon 2>/dev/null | head -n 1 || true)
+            WIN_DL=""
+            [ -n "$FOUND_FILE" ] && WIN_DL="$(dirname "$FOUND_FILE")"
             if [ -z "$WIN_DL" ]; then
-                echo "[ERRO] Pasta Downloads nao encontrada em /mnt/disks/*!"
+                echo "[ERRO] Nenhum arquivo de update encontrado em Users/*/Downloads!"
             else
                 echo "[GoldenOSX] Aplicando updates de $WIN_DL..."
+                UPDATED=0
                 for f in stela-vgpu-daemon goldenosx-launch.sh goldenosx-menu.sh goldenosx-install.sh; do
                     if [ -f "$WIN_DL/$f" ]; then
                         cp "$WIN_DL/$f" "/opt/goldenosx/bin/$f"
                         chmod +x "/opt/goldenosx/bin/$f"
                         echo "  -> Atualizado: $f"
+                        UPDATED=$((UPDATED + 1))
                     fi
                 done
                 # Also ensure visual GRUB is embedded in all EFI GRUB binaries
