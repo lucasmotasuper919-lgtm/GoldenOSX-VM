@@ -64,7 +64,11 @@ YRES="${STELA_YRES:-768}"
 VK_BACKEND="${STELA_VK_BACKEND:-auto}"
 
 NPROC=$(nproc)
-QEMU_CPUS=2
+if [ "$NPROC" -ge 4 ]; then
+    QEMU_SMP="4,cores=2,threads=2"
+else
+    QEMU_SMP="${NPROC},cores=${NPROC},threads=1"
+fi
 LP_THREADS="$NPROC"
 [ "$LP_THREADS" -gt 8 ] && LP_THREADS=8
 
@@ -101,7 +105,7 @@ QEMU_CMD=(
     qemu-system-x86_64
     -machine q35,accel=kvm
     -cpu host
-    -smp "${QEMU_CPUS},cores=${QEMU_CPUS},threads=1"
+    -smp "${QEMU_SMP}"
     -m "${GUEST_MB}"
     -object "memory-backend-file,id=mem1,size=${GUEST_MB}M,mem-path=${GUEST_RAM},share=on"
     -machine memory-backend=mem1
