@@ -65,16 +65,12 @@ VK_BACKEND="${STELA_VK_BACKEND:-auto}"
 
 NPROC=$(nproc)
 QEMU_CPUS=2
-QEMU_TASKSET=()
-VGPU_TASKSET=()
-if [ "$NPROC" -ge 4 ] && command -v taskset >/dev/null 2>&1; then
-    QEMU_TASKSET=(taskset -c 0,1)
-    VGPU_TASKSET=(taskset -c 2,3)
-fi
+LP_THREADS="$NPROC"
+[ "$LP_THREADS" -gt 8 ] && LP_THREADS=8
 
 export LD_LIBRARY_PATH="/opt/goldenosx/lib:${LD_LIBRARY_PATH:-}"
 
-echo "[GoldenOSX] Iniciando stela-vgpu-daemon (RAM=${GUEST_MB}M, Vulkan=${VK_BACKEND})..."
+echo "[GoldenOSX] Iniciando stela-vgpu-daemon (RAM=${GUEST_MB}M, Vulkan=${VK_BACKEND}, LP_THREADS=${LP_THREADS})..."
 STELA_GUEST_RAM_MB="$GUEST_MB" \
 STELA_GUEST_RAM_PATH="$GUEST_RAM" \
 STELA_VK_BACKEND="$VK_BACKEND" \
@@ -82,9 +78,9 @@ STELA_NIR_CACHE_DIR="$CACHE_BASE/nir" \
 MESA_SHADER_CACHE_DISABLE=false \
 MESA_DISK_CACHE_SINGLE_FILE=true \
 MESA_SHADER_CACHE_DIR="$CACHE_BASE/mesa" \
-GALLIVM_PERF=nopt,brilinear,rho_approx \
-LP_NUM_THREADS=2 \
-"${VGPU_TASKSET[@]}" "$VGPU_BIN" >"$VGPU_LOG" 2>&1 &
+GALLIVM_PERF=nopt,brilinear,rho_approx,no_quad_lod \
+LP_NUM_THREADS="$LP_THREADS" \
+"$VGPU_BIN" >"$VGPU_LOG" 2>&1 &
 VGPU_PID=$!
 
 for _ in $(seq 1 80); do
@@ -102,7 +98,7 @@ for _ in $(seq 1 80); do
 done
 
 QEMU_CMD=(
-    "${QEMU_TASKSET[@]}" qemu-system-x86_64
+    qemu-system-x86_64
     -machine q35,accel=kvm
     -cpu host
     -smp "${QEMU_CPUS},cores=${QEMU_CPUS},threads=1"

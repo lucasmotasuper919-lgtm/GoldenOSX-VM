@@ -794,12 +794,12 @@ fn main() {
         let req_seq = header.guest_seq.load(Ordering::Acquire);
         if req_seq == last_seq {
             idle_spins = idle_spins.saturating_add(1);
-            if idle_spins < 5_000 {
+            if idle_spins < 10_000 {
                 std::hint::spin_loop();
-            } else if last_seq == 0 || idle_spins > 10_000 {
+            } else if last_seq == 0 || idle_spins > 40_000 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             } else {
-                std::thread::sleep(std::time::Duration::from_micros(100));
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
             continue;
         }
@@ -905,6 +905,7 @@ fn main() {
             // or vanishing windows!). Non-submit ops never block here.
             let max_wait = std::time::Duration::from_millis(1200);
             let wait_start = Instant::now();
+            let mut polls = 0u32;
             while shared.awaits_completion() {
                 shared.interrupted();
                 if !shared.awaits_completion() {
@@ -913,7 +914,12 @@ fn main() {
                 if wait_start.elapsed() > max_wait {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_micros(150));
+                polls += 1;
+                if polls < 200 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(30));
+                }
             }
             static COMPLETED_LOG: AtomicU64 = AtomicU64::new(0);
             let c = COMPLETED_LOG.fetch_add(1, Ordering::Relaxed) + 1;
