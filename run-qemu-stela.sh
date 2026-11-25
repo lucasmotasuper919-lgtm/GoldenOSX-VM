@@ -120,6 +120,7 @@ fi
     "${GPU_ARGS[@]}" \
     "${DISPLAY_ARGS[@]}" \
     -device qemu-xhci \
+    -device usb-tablet \
     -chardev stdio,id=ser0,mux=on,logfile="$SCRIPT_DIR/qemu-serial.log",logappend=off \
     -serial chardev:ser0 \
     -mon chardev=ser0

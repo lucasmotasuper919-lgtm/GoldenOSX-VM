@@ -117,6 +117,7 @@ QEMU_CMD=(
     -net none
     -device "virtio-vga,xres=${XRES},yres=${YRES}"
     -device qemu-xhci
+    -device usb-tablet
     -chardev "file,id=ser0,path=${SERIAL_LOG}"
     -serial chardev:ser0
 )
@@ -130,12 +131,12 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && command -v cage >/d
     mkdir -p "$XDG_RUNTIME_DIR"
     chmod 700 "$XDG_RUNTIME_DIR"
     export WLR_LIBINPUT_NO_DEVICES=1
-    if ! cage -m last -s -- "${QEMU_CMD[@]}" -display gtk,full-screen=on,grab-on-hover=on 2>"$QEMU_LOG"; then
+    if ! cage -m last -s -- "${QEMU_CMD[@]}" -display gtk,full-screen=on,show-cursor=off 2>"$QEMU_LOG"; then
         echo "[GoldenOSX] cage -m last falhou, log:"
         cat "$QEMU_LOG"
     fi
 else
-    if ! "${QEMU_CMD[@]}" -display gtk,full-screen=on,grab-on-hover=on 2>"$QEMU_LOG"; then
+    if ! "${QEMU_CMD[@]}" -display gtk,full-screen=on,show-cursor=off 2>"$QEMU_LOG"; then
         echo "[GoldenOSX] QEMU saiu com erro! Log ($QEMU_LOG):"
         cat "$QEMU_LOG"
     fi
