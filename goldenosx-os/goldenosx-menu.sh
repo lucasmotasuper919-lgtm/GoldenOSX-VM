@@ -113,6 +113,28 @@ while true; do
                         echo "  -> Atualizado: $f"
                     fi
                 done
+                # Also ensure visual GRUB is embedded in all EFI GRUB binaries
+                mount /boot/efi 2>/dev/null || true
+                if [ -f /boot/grub/grub.cfg ] && command -v grub-mkstandalone >/dev/null 2>&1; then
+                    TMP_EFI="/tmp/goldenosx-grubx64.efi"
+                    grub-mkstandalone \
+                        --format=x86_64-efi \
+                        --output="$TMP_EFI" \
+                        --locales="" \
+                        --fonts="" \
+                        "boot/grub/grub.cfg=/boot/grub/grub.cfg" 2>/dev/null || true
+                    if [ -f "$TMP_EFI" ]; then
+                        mkdir -p /boot/efi/EFI/GoldenOSX-OS
+                        cp "$TMP_EFI" /boot/efi/EFI/GoldenOSX-OS/grubx64.efi
+                        for existing in /boot/efi/EFI/*/grubx64.efi /boot/efi/EFI/*/shimx64.efi; do
+                            [ -f "$existing" ] && cp "$TMP_EFI" "$existing" && echo "  -> GRUB visual: $existing"
+                        done
+                        for d in /boot/efi/EFI/GoldenOSX-OS /boot/efi/EFI/debian /boot/efi/EFI/BOOT; do
+                            mkdir -p "$d" && cp /boot/grub/grub.cfg "$d/grub.cfg"
+                        done
+                        rm -f "$TMP_EFI"
+                    fi
+                fi
                 sync
                 echo "[GoldenOSX] Update concluido! Recarregando menu..."
                 sleep 1
