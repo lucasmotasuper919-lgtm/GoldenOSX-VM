@@ -38,7 +38,20 @@ type VisitBytes = unsafe extern "C" fn(*mut c_void, *const c_void, usize);
 
 const SHM_PATH: &str = "/dev/shm/stela-vgpu-shm";
 const DEFAULT_RAM_PATH: &str = "/home/lucas/.gemini/antigravity/scratch/stela-mod/.stela-guest-ram";
-const GUEST_RAM_SIZE: usize = 4 * 1024 * 1024 * 1024;
+const DEFAULT_GUEST_RAM_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
+static GUEST_RAM_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
+
+fn guest_ram_size() -> usize {
+    *GUEST_RAM_SIZE_BYTES.get_or_init(|| {
+        std::env::var("STELA_GUEST_RAM_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&mb| mb >= 2048)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(DEFAULT_GUEST_RAM_SIZE)
+    })
+}
 
 unsafe extern "system" {
     fn vk_icdGetInstanceProcAddr(
@@ -156,7 +169,7 @@ fn ensure_guest_ram_fd() -> Result<RawFd, MetalError> {
     Ok(*GUEST_RAM_FD.get().unwrap())
 }
 
-/// On QEMU Q35 with 4 GiB RAM, RAM sits at `[0..2 GiB)` and `[4 GiB..6 GiB)`.
+/// On QEMU Q35 with >= 2 GiB RAM, low RAM sits at `[0..2 GiB)` and high RAM at `[4 GiB..4 GiB + (total - 2 GiB))`.
 fn qemu_q35_ram_offset(pa: u64) -> Option<i64> {
     const LOW_RAM_END: u64 = 0x8000_0000;
     const HIGH_RAM_BASE: u64 = 0x1_0000_0000;
@@ -164,7 +177,7 @@ fn qemu_q35_ram_offset(pa: u64) -> Option<i64> {
         Some(pa as i64)
     } else if pa >= HIGH_RAM_BASE {
         let off = (pa - HIGH_RAM_BASE) + LOW_RAM_END;
-        if (off as usize) < GUEST_RAM_SIZE {
+        if (off as usize) < guest_ram_size() {
             Some(off as i64)
         } else {
             None
@@ -330,8 +343,31 @@ fn probe_external_hardware_gpu(
             if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
                 || props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
             {
-                if found_hw.is_none() {
+                let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+                let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+                let mut f2 = vk::PhysicalDeviceFeatures2::default()
+                    .push_next(&mut v12)
+                    .push_next(&mut v13);
+                instance.get_physical_device_features2(pdev, &mut f2);
+                let has_core = props.api_version >= vk::API_VERSION_1_3
+                    && v12.descriptor_indexing == vk::TRUE
+                    && v12.runtime_descriptor_array == vk::TRUE
+                    && v12.buffer_device_address == vk::TRUE
+                    && v12.timeline_semaphore == vk::TRUE
+                    && v12.shader_float16 == vk::TRUE
+                    && v13.dynamic_rendering == vk::TRUE
+                    && v13.synchronization2 == vk::TRUE;
+                if has_core && found_hw.is_none() {
                     found_hw = Some((name, props.api_version));
+                } else if !has_core {
+                    seen.push(format!(
+                        "  -> {name} skipped: missing Stela reqs (vk1.3={}, descIdx={}, bda={}, fp16={}, dynRend={})",
+                        props.api_version >= vk::API_VERSION_1_3,
+                        v12.descriptor_indexing == vk::TRUE,
+                        v12.buffer_device_address == vk::TRUE,
+                        v12.shader_float16 == vk::TRUE,
+                        v13.dynamic_rendering == vk::TRUE,
+                    ));
                 }
             }
         }

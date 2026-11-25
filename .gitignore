@@ -24,3 +24,4 @@
 /vhd_STELA_*.txt
 /__pycache__/
 /patch_stela_vm4gb*.py
+/*.iso

@@ -22,7 +22,33 @@
 - **Persistent AIR→NIR Disk Shader Cache (`.stela-nir-cache/`)**:
   - Serializes compiled `nir_shader` objects via Mesa's `nir_serialize()` / `nir_deserialize()`, turning 250+ Metal shader compilations on subsequent boots into `< 1ms` cache hits.
 - **Verified End-to-End on macOS 27.2 (Build 26B123)**:
-  - Boots to Lock Screen, Liquid Glass compositor, Setup Assistant, and full **macOS Desktop (Dock, Finder, Keyboard Setup Assistant)** on an Intel Core i5-6287U (2 cores / 8 GB RAM) inside WSL2!
+  - Boots to Lock Screen, Liquid Glass compositor, Setup Assistant, and full **macOS Desktop (Dock, Finder, System Settings)** on an Intel Core i5-6287U (2 cores / 8 GB RAM)!
+
+## GoldenOSX-OS (Bare-Metal Debian 13 Minimal ISO + Dual-Boot Installer)
+
+For maximum performance without Windows/WSL2 overhead, `goldenosx-os/` builds a **~409 MB bootable Debian 13 (Trixie) UEFI ISO** with:
+- **Bare-metal KVM** + **QEMU + OVMF** + **Cage** (fullscreen Wayland kiosk directly on DRM/KMS, `-m last` external monitor support)
+- **Auto-detection & NTFS/ext4 mounting** of your existing `stela-boot.vmdk` / `macOS 26.vmdk`
+- **Safe UEFI Dual-Boot SSD Installer** (`goldenosx-install.sh`, refuses NTFS/EFI partitions, formats only the chosen target ext4 partition, creates a 4 GB `/swapfile`, and installs GRUB UEFI alongside Windows Boot Manager)
+- **Persistent SSD shader caches & logs** (`.goldenosx-cache/{nir,mesa,logs}`)
+
+### Real-World Benchmarks (Intel Core i5-6287U, 2 cores / 8 GB RAM, Lavapipe CPU)
+| Metric | Measured Result |
+|---|---|
+| Boot to `WindowServer` | **~3 minutes** |
+| Boot to Lock Screen | **~5 minutes** |
+| Desktop Framerate (`presented_60s`) | **~20 FPS avg / 33.2 FPS peak** |
+| Persistent NIR Shader Cache | **99% cache hit rate** (`136/137` shaders loaded in `< 1ms`) |
+| Process Stability | **0 crashes** across 16 macOS clients (`WindowServer`, `Finder`, `System Settings`, etc.) |
+
+```bash
+# Build GoldenOSX-OS.iso (Debian 13 minimal + KVM + QEMU + stela-vgpu-daemon)
+sudo apt-get install -y debootstrap squashfs-tools xorriso grub-efi-amd64-bin mtools dosfstools
+sudo ./goldenosx-os/build-iso.sh
+
+# Fast incremental ISO repack (~25s after editing scripts or daemon)
+sudo ./goldenosx-os/update-iso.sh
+```
 
 ## Key Modifications over Upstream Stela
 

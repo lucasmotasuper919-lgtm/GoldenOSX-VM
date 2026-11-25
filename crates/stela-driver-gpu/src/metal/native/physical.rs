@@ -546,7 +546,7 @@ pub(super) fn probe(
         && extensions.has(ext::external_memory_dma_buf::NAME);
     limits.stencil_export = extensions.has(ext::shader_stencil_export::NAME);
     let mem = if identity.driver_id == DriverId::MesaLlvmpipe {
-        memory(instance, device, extensions).capped(384 * 1024 * 1024)
+        memory(instance, device, extensions).capped(768 * 1024 * 1024)
     } else {
         memory(instance, device, extensions)
     };
