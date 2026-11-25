@@ -96,9 +96,30 @@ while true; do
     echo "  [8] Reiniciar"
     echo "  [9] Desligar"
     echo "  [0] Instalar GoldenOSX-OS no SSD (Dual-Boot com Windows)"
+    echo "  [u] Atualizar GoldenOSX-OS (aplicar updates de Downloads)"
     echo ""
-    read -rp "Escolha uma opcao [0-9]: " opt
+    read -rp "Escolha uma opcao [0-9, u]: " opt
     case "$opt" in
+        u|U)
+            WIN_DL=$(ls -d /mnt/disks/*/Users/*/Downloads 2>/dev/null | head -n 1 || true)
+            if [ -z "$WIN_DL" ]; then
+                echo "[ERRO] Pasta Downloads nao encontrada em /mnt/disks/*!"
+            else
+                echo "[GoldenOSX] Aplicando updates de $WIN_DL..."
+                for f in stela-vgpu-daemon goldenosx-launch.sh goldenosx-menu.sh goldenosx-install.sh; do
+                    if [ -f "$WIN_DL/$f" ]; then
+                        cp "$WIN_DL/$f" "/opt/goldenosx/bin/$f"
+                        chmod +x "/opt/goldenosx/bin/$f"
+                        echo "  -> Atualizado: $f"
+                    fi
+                done
+                sync
+                echo "[GoldenOSX] Update concluido! Recarregando menu..."
+                sleep 1
+                exec /opt/goldenosx/bin/goldenosx-menu.sh
+            fi
+            read -rp "Pressione Enter para voltar ao menu..."
+            ;;
         0)
             /opt/goldenosx/bin/goldenosx-install.sh || true
             read -rp "Pressione Enter para voltar ao menu..."
