@@ -82,7 +82,7 @@ STELA_NIR_CACHE_DIR="$CACHE_BASE/nir" \
 MESA_SHADER_CACHE_DISABLE=false \
 MESA_DISK_CACHE_SINGLE_FILE=true \
 MESA_SHADER_CACHE_DIR="$CACHE_BASE/mesa" \
-GALLIVM_PERF=nopt,brilinear,rho_approx,no_quad_lod \
+GALLIVM_PERF=nopt,brilinear,rho_approx \
 LP_NUM_THREADS="$LP_THREADS" \
 "$VGPU_BIN" >"$VGPU_LOG" 2>&1 &
 VGPU_PID=$!
