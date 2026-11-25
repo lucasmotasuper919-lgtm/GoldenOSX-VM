@@ -1,0 +1,523 @@
+//! In-boot reuse of a block at another virtual address: the same page
+//! content mapped at a new address on each exec (a main program, the loader)
+//! is rebased from a stored entry instead of compiled again.
+//!
+//! The board keeps, by (page key, entry offset, entry context), what its
+//! PEs compiled there: first only the PC it was compiled at (`Seen`). A
+//! compile of the same key, offset and context at another PC keeps the
+//! block's stored form ([`Entry::stored`], from the relocations its
+//! compiler recorded); later fetches at any page of that content relocate it
+//! ([`Entry::relocate`]), with the checks the pack's entries pass: the
+//! admitted input equal to the fetch's bytes, a page-aligned rebase and
+//! recovery rows that rebase.
+//!
+//! The same entries serve code the ring took away and the guest runs
+//! again: a block compiled again within the ring's tenure age (its ghost
+//! says so, [`super::churn::Churn::promotes`]) keeps its stored form too,
+//! and its next return after the ring takes it away again is relocated
+//! from it instead of compiled. Hot code that the ring keeps losing, which
+//! comes back every turn, is what is kept; a host gives the bound
+//! ([`Rebases::set_bound`]) from the bytes it once gave to blocks shared at
+//! compile time alone.
+//!
+//! Keys are content keys (the SHA-256 of the whole fetch page) and the
+//! context digest names every compile input, so a rewritten frame hashes to
+//! another key and never reaches an entry of its old bytes; entries of
+//! content no frame holds any more leave with the bound. Memory is bounded:
+//! when full, the oldest keys go first, but a kept entry used since its
+//! last turn gets one more (a clock): a hit sets a bit, and moves nothing.
+//! The map orders keys by their digests' first eight bytes, and a slot
+//! holds its whole key: a slot whose key differs is another block's.
+use super::recovery::StoredOrigin;
+use crate::platform::sync::Mutex;
+use crate::translations::{Digest, Entry};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// The bytes all parts keep at most.
+#[cfg(not(test))]
+pub(super) const BOUND: usize = 48 << 20;
+#[cfg(test)]
+pub(super) const BOUND: usize = 1 << 20;
+/// Parts by the page key's first byte, each under its own lock.
+const PARTS: usize = 8;
+
+type Key = (Digest, u16, Digest);
+/// A key's place in the map: its digests' first eight bytes.
+type Short = (u64, u16, u64);
+
+fn short((key, offset, context): &Key) -> Short {
+    let first = |digest: &Digest| u64::from_le_bytes(digest.0[..8].try_into().expect("8 bytes"));
+    (first(key), *offset, first(context))
+}
+
+/// What a key, its slot and its place in the order cost, apart from a
+/// kept entry's buffers: a map node's share and the order's place.
+const KEY_BYTES: usize = 2 * core::mem::size_of::<(Short, Held)>()
+    + core::mem::size_of::<Short>()
+    + 4 * core::mem::size_of::<usize>();
+
+/// A slot, its whole key, and whether it served since the clock passed it;
+/// for a kept entry, the origin its last install made
+/// ([`Rebases::originate`]).
+struct Held {
+    key: Key,
+    slot: Slot,
+    used: bool,
+    origin: Option<Arc<StoredOrigin>>,
+}
+
+#[derive(Clone)]
+enum Slot {
+    /// Compiled at this PC only so far.
+    Seen(u64),
+    Kept(Arc<Entry>),
+    /// Its compiler found a value no relocation reproduces: it is compiled
+    /// at every address.
+    Unstorable,
+}
+
+impl Slot {
+    fn bytes(&self) -> usize {
+        KEY_BYTES
+            + match self {
+                Self::Kept(entry) => entry.retained_bytes() + core::mem::size_of::<StoredOrigin>(),
+                _ => 0,
+            }
+    }
+}
+
+#[derive(Default)]
+struct Part {
+    slots: BTreeMap<Short, Held>,
+    /// Each slot's place once, oldest first: the clock's hand is the front.
+    order: VecDeque<Short>,
+    bytes: usize,
+}
+
+impl Part {
+    /// The slot of `key`, if the map holds it.
+    fn get(&mut self, key: &Key) -> Option<&mut Held> {
+        self.slots
+            .get_mut(&short(key))
+            .filter(|held| held.key == *key)
+    }
+
+    fn put(&mut self, key: Key, slot: Slot, bound: usize) {
+        let bytes = slot.bytes();
+        if bytes > bound {
+            return;
+        }
+        let at = short(&key);
+        // A key kept again keeps its place; another key at its place is
+        // replaced.
+        if let Some(held) = self.slots.get_mut(&at) {
+            self.bytes -= held.slot.bytes();
+            *held = Held {
+                key,
+                slot,
+                used: false,
+                origin: None,
+            };
+            self.bytes += bytes;
+            self.evict(bound, Some(at));
+            return;
+        }
+        self.evict(bound.saturating_sub(bytes), None);
+        self.order.push_back(at);
+        self.slots.insert(
+            at,
+            Held {
+                key,
+                slot,
+                used: false,
+                origin: None,
+            },
+        );
+        self.bytes += bytes;
+    }
+
+    /// Let the oldest slots go until the part holds `bound` bytes or less,
+    /// all but `keep`: one used since the hand passed it is passed again.
+    /// Two turns at most, as each pass clears what it passes.
+    fn evict(&mut self, bound: usize, keep: Option<Short>) {
+        let mut passes = 2 * self.order.len();
+        while self.bytes > bound && passes != 0 {
+            passes -= 1;
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            let held = self.slots.get_mut(&oldest).expect("an ordered slot");
+            if held.used || keep == Some(oldest) {
+                held.used = false;
+                self.order.push_back(oldest);
+                continue;
+            }
+            let gone = self.slots.remove(&oldest).expect("an ordered slot");
+            self.bytes -= gone.slot.bytes();
+        }
+    }
+}
+
+/// What a fetch does with a block the store keys.
+pub(super) enum Found {
+    /// Relocate this entry, with the origin its last install made.
+    Entry(Arc<Entry>, Option<Arc<StoredOrigin>>),
+    /// Compile it, then keep its stored form ([`Rebases::keep`]): it was
+    /// compiled at another PC before.
+    Keep,
+    /// Compile it.
+    Compile,
+}
+
+/// Reuse hits and entries kept, for `PES CODE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RebaseCounts {
+    /// Installs relocated from a kept entry.
+    pub hits: u64,
+    /// Entries kept, and blocks with no stored form.
+    pub kept: u64,
+    pub unstorable: u64,
+    /// The bytes kept now.
+    pub bytes: usize,
+}
+
+/// The board's kept entries, by page key, offset and context.
+pub(super) struct Rebases {
+    parts: [Mutex<Part>; PARTS],
+    /// Each part's share of the bound.
+    bound: AtomicUsize,
+    hits: AtomicU64,
+    kept: AtomicU64,
+    unstorable: AtomicU64,
+}
+
+impl Rebases {
+    pub(super) fn new(bound: usize) -> Self {
+        Self {
+            parts: core::array::from_fn(|_| Mutex::new(Part::default())),
+            bound: AtomicUsize::new(bound / PARTS),
+            hits: AtomicU64::new(0),
+            kept: AtomicU64::new(0),
+            unstorable: AtomicU64::new(0),
+        }
+    }
+
+    /// Keep up to `bound` bytes from now on: a part over its share lets its
+    /// oldest keys go at its next keep.
+    pub(super) fn set_bound(&self, bound: usize) {
+        self.bound.store(bound / PARTS, Ordering::Relaxed);
+    }
+
+    fn bound(&self) -> usize {
+        self.bound.load(Ordering::Relaxed)
+    }
+
+    /// Whether its parts keep less than half their bound in all.
+    pub(super) fn under_half(&self) -> bool {
+        self.counts().bytes < self.bound() * PARTS / 2
+    }
+
+    fn part(&self, key: &Digest) -> crate::platform::sync::MutexGuard<'_, Part> {
+        self.parts[usize::from(key.0[0]) % PARTS]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// What a fetch at `pc` of the block at `offset` of the page whose
+    /// bytes hash to `key`, compiled in `context`, does. A key not known
+    /// yet is noted as compiled at `pc`. `again` says the ring took the
+    /// block away within its tenure age: its compile keeps its form.
+    pub(super) fn look(
+        &self,
+        key: &Digest,
+        offset: u16,
+        context: &Digest,
+        pc: u64,
+        again: bool,
+    ) -> Found {
+        let slot = (*key, offset, *context);
+        let mut part = self.part(key);
+        match part.get(&slot) {
+            Some(Held {
+                slot: Slot::Kept(entry),
+                used,
+                origin,
+                ..
+            }) => {
+                *used = true;
+                Found::Entry(Arc::clone(entry), origin.clone())
+            }
+            Some(Held {
+                slot: Slot::Seen(seen),
+                ..
+            }) if *seen != pc || again => Found::Keep,
+            Some(_) => Found::Compile,
+            None => {
+                let bound = self.bound();
+                part.put(slot, Slot::Seen(pc), bound);
+                if again { Found::Keep } else { Found::Compile }
+            }
+        }
+    }
+
+    /// Keep the stored form of the block at `offset` of `key` in
+    /// `context`: its entry, or `None` when it has none.
+    pub(super) fn keep(&self, key: &Digest, offset: u16, context: &Digest, entry: Option<Entry>) {
+        let slot = match entry {
+            Some(entry) => {
+                self.kept.fetch_add(1, Ordering::Relaxed);
+                Slot::Kept(Arc::new(entry))
+            }
+            None => {
+                self.unstorable.fetch_add(1, Ordering::Relaxed);
+                Slot::Unstorable
+            }
+        };
+        self.part(key)
+            .put((*key, offset, *context), slot, self.bound());
+    }
+
+    /// Keep `origin` with the entry of `key`, `offset` and `context` it
+    /// names, for the next install at its page: one allocation per page,
+    /// not per install.
+    pub(super) fn originate(
+        &self,
+        key: &Digest,
+        offset: u16,
+        context: &Digest,
+        origin: &Arc<StoredOrigin>,
+    ) {
+        let mut part = self.part(key);
+        if let Some(held) = part.get(&(*key, offset, *context))
+            && let (Slot::Kept(entry), Some(kept)) = (&held.slot, &origin.kept)
+            && Arc::ptr_eq(entry, kept)
+        {
+            held.origin = Some(Arc::clone(origin));
+        }
+    }
+
+    /// Count an install relocated from a kept entry.
+    pub(super) fn hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn counts(&self) -> RebaseCounts {
+        RebaseCounts {
+            hits: self.hits.load(Ordering::Relaxed),
+            kept: self.kept.load(Ordering::Relaxed),
+            unstorable: self.unstorable.load(Ordering::Relaxed),
+            bytes: (0..PARTS)
+                .map(|at| {
+                    self.parts[at]
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .bytes
+                })
+                .sum(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(offset: u16, code: usize) -> Entry {
+        Entry {
+            context: Digest::default(),
+            offset,
+            source_bytes: 4,
+            cold: (0, 0),
+            input: alloc::vec![0; 4],
+            code: alloc::vec![0; code],
+            relocations: alloc::vec![],
+            source_map: alloc::vec![(offset, 0)],
+            exits: alloc::vec![],
+            recovery: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_second_pc_keeps_the_entry_and_it_serves_every_pc() {
+        let rebases = Rebases::new(BOUND);
+        let (key, context) = (Digest([1; 32]), Digest([2; 32]));
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x1008, false),
+            Found::Compile
+        ));
+        // The same PC again (its block went) compiles; another keeps.
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x1008, false),
+            Found::Compile
+        ));
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x5008, false),
+            Found::Keep
+        ));
+        rebases.keep(&key, 8, &context, Some(entry(8, 64)));
+        for pc in [0x1008, 0x5008, 0x9008] {
+            assert!(matches!(
+                rebases.look(&key, 8, &context, pc, false),
+                Found::Entry(..)
+            ));
+        }
+        // Another context or offset is another block.
+        assert!(matches!(
+            rebases.look(&key, 8, &Digest([3; 32]), 0x9008, false),
+            Found::Compile
+        ));
+        assert!(matches!(
+            rebases.look(&key, 12, &context, 0x900c, false),
+            Found::Compile
+        ));
+        rebases.keep(&key, 12, &context, None);
+        assert!(matches!(
+            rebases.look(&key, 12, &context, 0xd00c, false),
+            Found::Compile
+        ));
+        let counts = rebases.counts();
+        assert_eq!((counts.kept, counts.unstorable), (1, 1));
+    }
+
+    /// A block the ring took away and the guest runs again keeps its form
+    /// at the same PC: its next return is relocated, not compiled. One the
+    /// ring did not take compiles again at its PC, as before.
+    #[test]
+    fn a_block_compiled_again_after_the_ring_took_it_keeps_its_entry() {
+        let rebases = Rebases::new(BOUND);
+        let (key, context) = (Digest([4; 32]), Digest([5; 32]));
+        assert!(matches!(
+            rebases.look(&key, 16, &context, 0x2010, false),
+            Found::Compile
+        ));
+        assert!(matches!(
+            rebases.look(&key, 16, &context, 0x2010, false),
+            Found::Compile
+        ));
+        assert!(matches!(
+            rebases.look(&key, 16, &context, 0x2010, true),
+            Found::Keep
+        ));
+        rebases.keep(&key, 16, &context, Some(entry(16, 64)));
+        assert!(matches!(
+            rebases.look(&key, 16, &context, 0x2010, false),
+            Found::Entry(..)
+        ));
+        // Never seen before, and taken away already (its ghost is older than
+        // the store's note of it): kept at once.
+        assert!(matches!(
+            rebases.look(&key, 32, &context, 0x2020, true),
+            Found::Keep
+        ));
+    }
+
+    /// An install keeps its origin with the entry, and the next look hands
+    /// it over; an origin of another entry is not kept, and a slot kept
+    /// again starts without one.
+    #[test]
+    fn a_kept_entry_hands_over_the_origin_its_last_install_made() {
+        let rebases = Rebases::new(BOUND);
+        let (key, context) = (Digest([6; 32]), Digest([7; 32]));
+        let _ = rebases.look(&key, 8, &context, 0x1008, false);
+        rebases.keep(&key, 8, &context, Some(entry(8, 64)));
+        let Found::Entry(kept, None) = rebases.look(&key, 8, &context, 0x5008, false) else {
+            panic!("a kept entry without an origin yet")
+        };
+        let preparation = Arc::new(super::super::fetch_costs::system_preparation());
+        let origin = |entry: Arc<Entry>| {
+            Arc::new(StoredOrigin {
+                key,
+                context,
+                page: 0x5000,
+                preparation: preparation.clone(),
+                kept: Some(entry),
+            })
+        };
+        rebases.originate(&key, 8, &context, &origin(Arc::new(entry(8, 64))));
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x5008, false),
+            Found::Entry(_, None)
+        ));
+        let made = origin(kept);
+        rebases.originate(&key, 8, &context, &made);
+        let Found::Entry(_, Some(handed)) = rebases.look(&key, 8, &context, 0x5008, false) else {
+            panic!("the origin kept")
+        };
+        assert!(Arc::ptr_eq(&handed, &made));
+        rebases.keep(&key, 8, &context, Some(entry(8, 64)));
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x5008, false),
+            Found::Entry(_, None)
+        ));
+    }
+
+    /// A host's bound replaces the default, and a part over it lets its
+    /// oldest keys go at its next keep.
+    #[test]
+    fn a_host_bound_holds_from_the_next_keep() {
+        let one = Slot::Kept(Arc::new(entry(0, 256))).bytes();
+        let rebases = Rebases::new(PARTS * one * 40);
+        let context = Digest::default();
+        let key = |n: u8| {
+            let mut bytes = [0; 32];
+            bytes[1] = n;
+            Digest(bytes)
+        };
+        for n in 0..30 {
+            rebases.keep(&key(n), 0, &context, Some(entry(0, 256)));
+        }
+        assert!(rebases.counts().bytes > one * 20);
+        rebases.set_bound(PARTS * one * 5);
+        rebases.keep(&key(30), 0, &context, Some(entry(0, 256)));
+        assert!(rebases.counts().bytes <= one * 5);
+    }
+
+    #[test]
+    fn the_oldest_keys_go_when_the_bound_is_full() {
+        // One part's share holds about ten keys with a small entry each.
+        let one = Slot::Kept(Arc::new(entry(0, 256))).bytes();
+        let rebases = Rebases::new(PARTS * one * 10);
+        let context = Digest::default();
+        // Keys of one part (the same first byte).
+        let key = |n: u8| {
+            let mut bytes = [0; 32];
+            bytes[1] = n;
+            Digest(bytes)
+        };
+        for n in 0..40 {
+            rebases.keep(&key(n), 0, &context, Some(entry(0, 256)));
+            assert!(rebases.counts().bytes <= PARTS * one * 10 / PARTS);
+        }
+        assert!(matches!(
+            rebases.look(&key(39), 0, &context, 0, false),
+            Found::Entry(..)
+        ));
+        assert!(matches!(
+            rebases.look(&key(0), 0, &context, 0, false),
+            Found::Compile
+        ));
+        // An entry in use stays while newer keys come.
+        for n in 40..80 {
+            assert!(matches!(
+                rebases.look(&key(38), 0, &context, 0, false),
+                Found::Entry(..)
+            ));
+            rebases.keep(&key(n), 0, &context, Some(entry(0, 256)));
+        }
+        assert!(matches!(
+            rebases.look(&key(39), 0, &context, 0, false),
+            Found::Compile
+        ));
+        // Keys kept or used again leave no unbounded order behind.
+        for _ in 0..1000 {
+            rebases.keep(&key(79), 0, &context, Some(entry(0, 256)));
+            let _ = rebases.look(&key(79), 0, &context, 0, false);
+        }
+        let part = rebases.part(&key(0));
+        assert_eq!(part.order.len(), part.slots.len());
+    }
+}

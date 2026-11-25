@@ -1,0 +1,1435 @@
+//! Class lifetime and permanent per-publication media validity.
+// SPDX-License-Identifier: GPL-2.0-only
+// Linux sd.c::sd_check_events/media_not_present/sd_revalidate_disk and
+// scsi_lib.c::scsi_io_completion_action. See NOTICE.
+use super::recovery::{Ladder, Step};
+use super::resume::{OTHER_IDENTITY, OTHER_MEDIUM, UNCHECKED_MEDIUM};
+use super::*;
+
+pub(super) fn no_media(sense: &Sense) -> bool {
+    matches!(sense.key, Sense::NOT_READY | Sense::UNIT_ATTENTION)
+        && sense.asc == Sense::MEDIUM_NOT_PRESENT
+}
+/// A change sd acts on: an absent medium or unit, and any UNIT ATTENTION
+/// on a removable unit (`scsi_io_completion_action`'s `sdev->changed`).
+pub(super) fn changed(sense: &Sense, removable: bool) -> bool {
+    sense.key == Sense::UNIT_ATTENTION && removable
+        || no_media(sense)
+        || sense.key == Sense::ILLEGAL_REQUEST && sense.asc == Sense::UNSUPPORTED_UNIT
+}
+
+/// The sense a failed command's `result` carries.
+fn sense_of<R>(result: &Result<R, BlockError>) -> Option<Sense> {
+    match result {
+        Err(BlockError::Sense(sense)) => Some(*sense),
+        _ => None,
+    }
+}
+
+/// Port resets an owner may run on its own in [`RESET_WINDOW_US`]; past
+/// that the device is left failed until an explicit rescan rebinds it.
+const RESET_LIMIT: usize = 3;
+const RESET_WINDOW_US: u64 = 60_000_000;
+/// What a command still running when its device was reset ends with, once
+/// it has had its one more run.
+pub(super) const RESET_ENDED: BlockError =
+    BlockError::Protocol("a USB device reset ended the command");
+
+/// A unit's LUN, what its probe gave (its identity and whether its medium
+/// is removable), and its first blocks ([`FIRST_BLOCKS`]) where they read.
+pub(super) type Probed<L> = (L, Result<(Identity, bool), BlockError>, Option<Vec<u8>>);
+
+/// What a command does to a unit's first blocks ([`FIRST_BLOCKS`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Touch {
+    /// It leaves the medium as it is.
+    None,
+    /// It writes `blocks` blocks at `lba` with its data.
+    Write { lba: u64, blocks: u64 },
+    /// It may change any block, in a way not followed here.
+    Unknown,
+}
+
+/// What `cdb` with `data` does to the medium: the WRITE and WRITE AND
+/// VERIFY commands write their range; any other command that sends data,
+/// MODE SELECT aside, and FORMAT UNIT, WRITE SAME, SANITIZE and a
+/// non-data ATA PASS-THROUGH (an erase or sanitize) may write anywhere. A
+/// command that only reads, ATA PASS-THROUGH data-in among them, leaves it.
+fn touch(cdb: &[u8], data: &Data<'_>) -> Touch {
+    let be = |bytes: &[u8]| bytes.iter().fold(0u64, |v, b| v << 8 | u64::from(*b));
+    let range = match (cdb.first().copied(), cdb.len()) {
+        // WRITE (6): a length of zero is 256 blocks.
+        (Some(0x0a), 6..) => Some((
+            be(&cdb[1..4]) & 0x1f_ffff,
+            match cdb[4] {
+                0 => 256,
+                blocks => u64::from(blocks),
+            },
+        )),
+        // WRITE (10), WRITE AND VERIFY (10).
+        (Some(scsi::WRITE_10 | 0x2e), 10..) => Some((be(&cdb[2..6]), be(&cdb[7..9]))),
+        // WRITE (12), WRITE AND VERIFY (12).
+        (Some(0xaa | 0xae), 12..) => Some((be(&cdb[2..6]), be(&cdb[6..10]))),
+        // WRITE (16), WRITE AND VERIFY (16).
+        (Some(scsi::WRITE_16 | 0x8e), 16..) => Some((be(&cdb[2..10]), be(&cdb[10..14]))),
+        _ => None,
+    };
+    match (range, data) {
+        (Some((lba, blocks)), _) => Touch::Write { lba, blocks },
+        // MODE SELECT (6) and (10) set parameters only.
+        (None, Data::Out(_)) if matches!(cdb.first(), Some(0x15 | 0x55)) => Touch::None,
+        (None, Data::Out(_)) => Touch::Unknown,
+        (None, Data::None)
+            if matches!(cdb.first(), Some(0x04 | 0x41 | 0x48 | 0x85 | 0x93 | 0xa1)) =>
+        {
+            Touch::Unknown
+        }
+        (None, _) => Touch::None,
+    }
+}
+
+pub(super) struct Owner<T: Scsi> {
+    pub transport: T,
+    prefix: String,
+    serial: String,
+    units: Vec<Unit<T::Lun>>,
+    /// Provisional publications: unit, validity and removability.
+    pending: Vec<(T::Lun, Rc<Cell<bool>>, bool)>,
+    /// The device was reset since its last UNIT ATTENTION: the next one,
+    /// unless it reports a changed medium, is retried once, as Linux
+    /// `scsi_check_sense` retries with `expecting_cc_ua`.
+    expecting_reset: bool,
+    /// When this owner's recent port resets ran, by the transport's clock.
+    resets: Vec<u64>,
+    /// A port reset rebound the transport during the current command.
+    rebound: bool,
+    /// Port resets that rebound the transport.
+    rebinds: u64,
+    /// The commands begun without waiting ([`Scsi::begin`]), by the handle
+    /// [`Scsi::end`] takes: each running with its retries, or its result,
+    /// taken while a waiting command ran first ([`Self::run`]) or when a
+    /// device reset ended it.
+    commands: Vec<Option<Queued<T::Lun>>>,
+    /// The transport failed and its device reset was declined or failed:
+    /// the commands it still ends are not reset again.
+    declined: bool,
+    /// The port's status when a command last failed in the transport
+    /// ([`Scsi::take_failure_status`]).
+    failure_status: Option<String>,
+    /// The last port reset that failed ([`Scsi::take_reset_failure`]).
+    reset_failure: Option<(String, BlockError)>,
+    /// Why the port reset run for the command under way failed, for that
+    /// command's recovery record ([`Ladder::reset_failed`]).
+    failed_reset: Option<BlockError>,
+    /// Times the device left the bus and came back, and was taken again
+    /// ([`Self::resume`]).
+    returned: u32,
+}
+/// A begun command and what [`Owner::run`]'s retries of it still allow.
+struct Begun<L> {
+    lun: L,
+    cdb: Vec<u8>,
+    data: Retry,
+    generation: u64,
+    /// A UNIT ATTENTION after a reset may still retry this attempt.
+    attention: bool,
+    /// Its runs down the recovery ladder ([`Ladder`]).
+    ladder: Ladder,
+    /// The unit's first blocks once the command completes, where it
+    /// writes them ([`Owner::first_blocks_after`]).
+    first_blocks: Option<Option<Vec<u8>>>,
+}
+/// A command begun without waiting: running on the transport under its
+/// handle there, waiting to run again until the transport's recovery has
+/// settled and it has room, or ended with its result.
+enum Queued<L> {
+    Running(Begun<L>, usize),
+    Waiting(Begun<L>),
+    Ended(Result<Vec<u8>, BlockError>),
+}
+/// A begun command's data, kept for its retry.
+enum Retry {
+    None,
+    In(usize),
+    Out(Vec<u8>),
+}
+impl Retry {
+    fn new(data: &Data<'_>) -> Self {
+        match data {
+            Data::None => Self::None,
+            Data::In(length) => Self::In(*length),
+            Data::Out(bytes) => Self::Out(bytes.to_vec()),
+        }
+    }
+    fn data(&self) -> Data<'_> {
+        match self {
+            Self::None => Data::None,
+            Self::In(length) => Data::In(*length),
+            Self::Out(bytes) => Data::Out(bytes),
+        }
+    }
+}
+struct Unit<L> {
+    lun: L,
+    identity: Identity,
+    valid: Rc<Cell<bool>>,
+    removable: bool,
+    /// The unit's first blocks ([`FIRST_BLOCKS`]) as the medium holds
+    /// them: read at publication, and followed through every write to them
+    /// that completed. `None` once a write to them failed or could not be
+    /// followed, or the medium changed: a device that comes back is then
+    /// not taken for this unit ([`Owner::resume`]).
+    first_blocks: Option<Vec<u8>>,
+}
+impl<T: Scsi> Owner<T> {
+    pub fn new(transport: T, prefix: String, serial: String) -> Self {
+        Self {
+            transport,
+            prefix,
+            serial,
+            units: Vec::new(),
+            pending: Vec::new(),
+            expecting_reset: false,
+            resets: Vec::new(),
+            rebound: false,
+            rebinds: 0,
+            commands: Vec::new(),
+            declined: false,
+            failure_status: None,
+            reset_failure: None,
+            failed_reset: None,
+            returned: 0,
+        }
+    }
+    pub fn invalidate(&mut self) {
+        for (_, valid, _) in &self.pending {
+            valid.set(false);
+        }
+        for unit in &self.units {
+            unit.valid.set(false);
+        }
+    }
+    /// Whether `lun` is published and still valid.
+    fn valid(&self, lun: T::Lun) -> bool {
+        self.units
+            .iter()
+            .any(|unit| unit.lun == lun && unit.valid.get())
+    }
+    /// Whether `lun` is removable; a unit not yet published is assumed so.
+    fn removable(&self, lun: T::Lun) -> bool {
+        let units = self.units.iter().map(|unit| (unit.lun, unit.removable));
+        let pending = self
+            .pending
+            .iter()
+            .map(|(unit, _, removable)| (*unit, *removable));
+        units
+            .chain(pending)
+            .find(|(unit, _)| *unit == lun)
+            .is_none_or(|(_, removable)| removable)
+    }
+    /// `lun`'s medium changed, as the sense `why` says, or by an eject:
+    /// its publication ends. A published unit's end is counted for the log
+    /// ([`super::recovery::take_media_changes`]).
+    fn changed(&mut self, lun: T::Lun, why: Option<Sense>) {
+        for (unit, valid, _) in &self.pending {
+            if *unit == lun {
+                valid.set(false);
+            }
+        }
+        for unit in &mut self.units {
+            if unit.lun == lun {
+                if unit.valid.get() {
+                    super::recovery::media_changed(why);
+                }
+                unit.valid.set(false);
+                // Its publication ended for another medium, which a device
+                // that comes back must never revive.
+                unit.first_blocks = None;
+            }
+        }
+    }
+    /// What `lun`'s first blocks hold once `cdb` with `data` completes:
+    /// `None` where it leaves them, `Some(None)` where what it leaves is
+    /// not known (a range not followed, or blocks not known before).
+    fn first_blocks_after(
+        &self,
+        lun: T::Lun,
+        cdb: &[u8],
+        data: &Data<'_>,
+    ) -> Option<Option<Vec<u8>>> {
+        let unit = self.units.iter().find(|unit| unit.lun == lun)?;
+        let size = unit.identity.block_size as usize;
+        let count = unit.identity.blocks.min(FIRST_BLOCKS);
+        let (lba, blocks) = match touch(cdb, data) {
+            Touch::None => return None,
+            Touch::Unknown => return Some(None),
+            Touch::Write { lba, blocks } if lba >= count || blocks == 0 => return None,
+            Touch::Write { lba, blocks } => (lba, blocks),
+        };
+        let Data::Out(bytes) = data else {
+            return Some(None);
+        };
+        if blocks.checked_mul(size as u64) != Some(bytes.len() as u64) {
+            return Some(None);
+        }
+        let end = lba.saturating_add(blocks).min(count);
+        let mut first = match &unit.first_blocks {
+            Some(first) if first.len() == count as usize * size => first.clone(),
+            // A write over all of them gives them whatever they held.
+            _ if lba == 0 && end == count => alloc::vec![0; count as usize * size],
+            _ => return Some(None),
+        };
+        for block in lba..end {
+            let at = (block - lba) as usize * size;
+            let to = block as usize * size;
+            first[to..to + size].copy_from_slice(&bytes[at..at + size]);
+        }
+        Some(Some(first))
+    }
+    /// Keep `first` as `lun`'s first blocks.
+    fn keep_first_blocks(&mut self, lun: T::Lun, first: Option<Vec<u8>>) {
+        if let Some(unit) = self.units.iter_mut().find(|unit| unit.lun == lun) {
+            unit.first_blocks = first;
+        }
+    }
+    fn reconcile(&mut self, disks: &mut [Disk<Self>]) {
+        for old in &self.units {
+            if let Some(disk) = disks.iter_mut().find(|disk| disk.lun == old.lun) {
+                if old.valid.get() && disk.identity == old.identity {
+                    disk.media = old.valid.clone();
+                } else {
+                    old.valid.set(false);
+                }
+            } else {
+                old.valid.set(false);
+            }
+        }
+        self.units = disks
+            .iter_mut()
+            .map(|disk| Unit {
+                lun: disk.lun,
+                identity: disk.identity.clone(),
+                valid: disk.media.clone(),
+                removable: disk.removable,
+                first_blocks: disk.first_blocks.take(),
+            })
+            .collect();
+    }
+
+    /// Run `command` on a published unit down the recovery ladder: a
+    /// transport error, or any failure a port reset ended, runs it again
+    /// once the transport's recovery has settled, as Linux's SCSI midlayer
+    /// requeues a `DID_ERROR` or `DID_RESET` command within sd's retries
+    /// and runtime ([`Ladder`]). A unit not yet published runs it once.
+    fn run<R>(
+        &mut self,
+        lun: T::Lun,
+        cdb: &[u8],
+        mut command: impl FnMut(&mut T) -> Result<R, BlockError>,
+    ) -> Result<R, BlockError> {
+        self.end_first();
+        let published = self.units.iter().any(|unit| unit.lun == lun);
+        let mut ladder = Ladder::new(self.transport.now_us());
+        loop {
+            self.rebound = false;
+            let generation = self.transport.generation();
+            let result = self.attempt(lun, cdb, &mut command);
+            let rebound = core::mem::take(&mut self.rebound);
+            let Err(error) = &result else {
+                ladder.completed();
+                return result;
+            };
+            let step = self.step(generation, rebound);
+            // A port reset this run's failure began that failed itself ends
+            // the command with the reset's cause, recorded once.
+            if let Some(reset) = self.failed_reset.take()
+                && published
+            {
+                ladder.reset_failed(error, &reset);
+                return result;
+            }
+            if !published || !ladder.again(error, step, self.transport.now_us(), self.usable(lun)) {
+                return result;
+            }
+        }
+    }
+
+    /// The step of the recovery ladder that ran since a command began at
+    /// transport generation `generation`; `rebound` when a port reset
+    /// replaced the transport.
+    fn step(&self, generation: u64, rebound: bool) -> Step {
+        if rebound {
+            Step::PortReset
+        } else if generation != self.transport.generation() {
+            Step::ClassReset
+        } else {
+            Step::Again
+        }
+    }
+
+    /// Whether `lun` is published, valid, on a transport that takes commands.
+    fn usable(&self, lun: T::Lun) -> bool {
+        self.valid(lun) && !self.transport.poisoned()
+    }
+
+    /// Whether a command waits to run again ([`Queued::Waiting`]).
+    fn waiting(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|queued| matches!(queued, Some(Queued::Waiting(_))))
+    }
+
+    /// One run of `command` and what its end means for the units.
+    fn attempt<R>(
+        &mut self,
+        lun: T::Lun,
+        cdb: &[u8],
+        command: &mut impl FnMut(&mut T) -> Result<R, BlockError>,
+    ) -> Result<R, BlockError> {
+        let generation = self.transport.generation();
+        let mut result = command(&mut self.transport);
+        if let Err(BlockError::Sense(sense)) = &result
+            && sense.key == Sense::UNIT_ATTENTION
+            && core::mem::take(&mut self.expecting_reset)
+            && !(sense.asc == Sense::MEDIUM_CHANGED && sense.ascq == 0)
+        {
+            result = command(&mut self.transport);
+        }
+        // A removable unit's UA identifies an invalidated media view, even
+        // when a later TUR consumes it and the capacity is unchanged.
+        let removable = self.removable(lun);
+        if matches!(&result, Err(BlockError::Sense(sense)) if changed(sense, removable))
+            || result.is_ok()
+                && cdb.first() == Some(&scsi::START_STOP_UNIT)
+                && cdb
+                    .get(4)
+                    .is_some_and(|flags| flags & scsi::LOAD_EJECT != 0)
+        {
+            self.changed(lun, sense_of(&result));
+        }
+        self.settle(generation, &result);
+        result
+    }
+
+    /// A waiting command runs on the transport alone: every begun one
+    /// ends before it starts, each result kept for the disk that began it.
+    fn end_first(&mut self) {
+        loop {
+            let mut running = false;
+            for handle in 0..self.commands.len() {
+                if !matches!(
+                    self.commands[handle],
+                    Some(Queued::Running(..) | Queued::Waiting(_))
+                ) {
+                    continue;
+                }
+                match self.end_begun(handle) {
+                    Some(result) => self.commands[handle] = Some(Queued::Ended(result)),
+                    None => running = true,
+                }
+            }
+            if !running {
+                return;
+            }
+            crate::waiting();
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Keep `queued` under `handle`.
+    fn store(&mut self, handle: usize, queued: Queued<T::Lun>) {
+        if handle == self.commands.len() {
+            self.commands.push(Some(queued));
+        } else {
+            self.commands[handle] = Some(queued);
+        }
+    }
+
+    /// Begin attempt `begun` of command `handle`; its failure ends it as
+    /// [`Self::end_begun`] would. `None` from a transport that runs commands
+    /// only to completion.
+    fn begin_attempt(
+        &mut self,
+        handle: usize,
+        begun: Begun<T::Lun>,
+    ) -> Option<Result<(), BlockError>> {
+        let started = self
+            .transport
+            .begin(begun.lun, &begun.cdb, begun.data.data())?;
+        // Until the write to them completes, the first blocks hold either.
+        if begun.first_blocks.is_some() {
+            self.keep_first_blocks(begun.lun, None);
+        }
+        Some(match started {
+            Ok(running) => {
+                self.store(handle, Queued::Running(begun, running));
+                Ok(())
+            }
+            // A retry may have begun meanwhile.
+            Err(error) => match self.ended_with(handle, begun, Err(error)) {
+                None => Ok(()),
+                Some(result) => result.map(drop),
+            },
+        })
+    }
+
+    /// Command `handle`'s result once it has one, after the retries
+    /// [`Self::run`] makes of a waiting command: once for a UNIT ATTENTION
+    /// a reset raised, and down the recovery ladder ([`Ladder`]) after a
+    /// transport error or a port reset. A retry begins once the transport
+    /// has room; its result comes at a later look.
+    fn end_begun(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
+        match self.commands.get(handle)? {
+            None => None,
+            Some(Queued::Ended(_)) => match self.commands[handle].take() {
+                Some(Queued::Ended(result)) => Some(result),
+                _ => None,
+            },
+            Some(Queued::Running(_, running)) => {
+                let result = self.transport.end(*running)?;
+                let Some(Queued::Running(begun, _)) = self.commands[handle].take() else {
+                    return None;
+                };
+                self.ended_with(handle, begun, result)
+            }
+            // Its run again begins once the transport has room.
+            Some(Queued::Waiting(_)) => {
+                if !self.transport.room() {
+                    return None;
+                }
+                let Some(Queued::Waiting(begun)) = self.commands[handle].take() else {
+                    return None;
+                };
+                self.retry(handle, begun)
+            }
+        }
+    }
+
+    fn ended_with(
+        &mut self,
+        handle: usize,
+        mut begun: Begun<T::Lun>,
+        result: Result<Vec<u8>, BlockError>,
+    ) -> Option<Result<Vec<u8>, BlockError>> {
+        if let Err(BlockError::Sense(sense)) = &result
+            && sense.key == Sense::UNIT_ATTENTION
+            && core::mem::take(&mut begun.attention)
+            && core::mem::take(&mut self.expecting_reset)
+            && !(sense.asc == Sense::MEDIUM_CHANGED && sense.ascq == 0)
+        {
+            return self.retry(handle, begun);
+        }
+        let removable = self.removable(begun.lun);
+        if matches!(&result, Err(BlockError::Sense(sense)) if changed(sense, removable))
+            || result.is_ok()
+                && begun.cdb.first() == Some(&scsi::START_STOP_UNIT)
+                && begun
+                    .cdb
+                    .get(4)
+                    .is_some_and(|flags| flags & scsi::LOAD_EJECT != 0)
+        {
+            self.changed(begun.lun, sense_of(&result));
+        }
+        self.settle(begun.generation, &result);
+        let rebound = core::mem::take(&mut self.rebound);
+        match &result {
+            Err(error) => {
+                let step = self.step(begun.generation, rebound);
+                let usable = self.usable(begun.lun);
+                if let Some(reset) = self.failed_reset.take() {
+                    begun.ladder.reset_failed(error, &reset);
+                } else if begun
+                    .ladder
+                    .again(error, step, self.transport.now_us(), usable)
+                {
+                    begun.attention = true;
+                    return self.retry(handle, begun);
+                }
+            }
+            Ok(_) => begun.ladder.completed(),
+        }
+        if result.is_ok()
+            && let Some(Some(first)) = begun.first_blocks
+        {
+            self.keep_first_blocks(begun.lun, Some(first));
+        }
+        Some(result)
+    }
+
+    /// Begin `begun` again: `None` while it runs or waits for the
+    /// transport's recovery to settle ([`Queued::Waiting`]), its failure to
+    /// begin as its result. A class reset that completed since it began
+    /// raises the UNIT ATTENTION its run again may meet first.
+    fn retry(
+        &mut self,
+        handle: usize,
+        mut begun: Begun<T::Lun>,
+    ) -> Option<Result<Vec<u8>, BlockError>> {
+        if !self.transport.room() {
+            self.store(handle, Queued::Waiting(begun));
+            return None;
+        }
+        let generation = self.transport.generation();
+        if generation != begun.generation {
+            self.expecting_reset = true;
+            begun.ladder.reached(Step::ClassReset);
+        }
+        begun.generation = generation;
+        match self.begin_attempt(handle, begun)? {
+            Ok(()) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// The commands still running on a transport a device reset replaced:
+    /// each within its retries ([`Ladder`]) begins again on the new one, as
+    /// Linux's SCSI error handling retries the commands a uas host reset
+    /// ended (`DID_RESET`); the others end failed.
+    fn restart_after_reset(&mut self) {
+        for handle in 0..self.commands.len() {
+            if !matches!(self.commands[handle], Some(Queued::Running(..))) {
+                continue;
+            }
+            let Some(Queued::Running(mut begun, _)) = self.commands[handle].take() else {
+                continue;
+            };
+            let usable = self.valid(begun.lun);
+            if !begun.ladder.again(
+                &RESET_ENDED,
+                Step::PortReset,
+                self.transport.now_us(),
+                usable,
+            ) {
+                self.commands[handle] = Some(Queued::Ended(Err(RESET_ENDED)));
+                continue;
+            }
+            begun.attention = true;
+            begun.generation = self.transport.generation();
+            let queued = match self
+                .transport
+                .begin(begun.lun, &begun.cdb, begun.data.data())
+            {
+                Some(Ok(running)) => Queued::Running(begun, running),
+                Some(Err(error)) => Queued::Ended(Err(error)),
+                None => Queued::Ended(Err(RESET_ENDED)),
+            };
+            self.commands[handle] = Some(queued);
+        }
+    }
+
+    /// What a command's end means for every unit: a class reset is expected
+    /// to raise a UNIT ATTENTION, a poisoned transport escalates to a port
+    /// reset, and a changed LUN inventory ends every publication.
+    fn settle<R>(&mut self, generation: u64, result: &Result<R, BlockError>) {
+        if generation != self.transport.generation() {
+            self.expecting_reset = true;
+        }
+        // The port's status as the transport first failed, kept across a
+        // reset that replaces the transport.
+        if let Some(status) = self.transport.take_failure_status() {
+            self.failure_status.get_or_insert(status);
+        }
+        if self.transport.poisoned() {
+            self.reset_device();
+        }
+        if matches!(
+            result,
+            Err(BlockError::Sense(Sense {
+                key: Sense::UNIT_ATTENTION,
+                asc: Sense::CONDITIONS_CHANGED,
+                ascq: Sense::LUNS_CHANGED,
+            }))
+        ) {
+            self.invalidate();
+            for unit in &mut self.units {
+                unit.first_blocks = None;
+            }
+        }
+    }
+
+    /// Linux usb-storage's ladder after a failed class reset: reset the
+    /// device's port, rebind a fresh transport to the same device, and keep
+    /// every unit that probes as it was published, so the disks published on
+    /// it go on working; [`Owner::run`] then runs the failed command again
+    /// within its retries ([`Ladder`]). At most
+    /// [`RESET_LIMIT`] resets run in [`RESET_WINDOW_US`]; past that, or when
+    /// the reset fails, every unit fails until an explicit rescan.
+    fn reset_device(&mut self) {
+        let now = self.transport.now_us();
+        self.resets
+            .retain(|at| now.wrapping_sub(*at) < RESET_WINDOW_US);
+        // The other commands a failed transport still ends find it failed
+        // too: one reset, as Linux's error handler runs one host reset.
+        if self.declined || self.resets.len() >= RESET_LIMIT {
+            self.declined = true;
+            self.invalidate();
+            return;
+        }
+        // The reset reuses the old binding's rings and buffers, on a root
+        // port or behind hubs (`xhci::Controller::reset_and_reuse`), so it
+        // needs no allocator. SAFETY: the empty range hands out no memory.
+        let mut none = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+        let Some(replaced) = self.transport.reset_device(&mut none) else {
+            self.declined = true;
+            self.invalidate();
+            return;
+        };
+        self.resets.push(now);
+        match replaced {
+            Ok(transport) => {
+                self.transport = transport;
+                self.expecting_reset = true;
+                self.revalidate();
+                self.restart_after_reset();
+                self.rebound = true;
+                self.rebinds += 1;
+            }
+            Err((operation, error)) => {
+                self.declined = true;
+                self.failed_reset = Some(error.clone());
+                self.reset_failure = Some((
+                    format!(
+                        "{} port reset after a failed command: {operation}",
+                        self.prefix
+                    ),
+                    error,
+                ));
+                self.invalidate();
+            }
+        }
+    }
+
+    /// The published units a device that came back is probed for, each LUN
+    /// with its location, and the serial number the probe names them by.
+    pub(super) fn published(&self) -> (Vec<(T::Lun, String)>, String) {
+        let units = self
+            .units
+            .iter()
+            .map(|unit| (unit.lun, unit.identity.location.clone()))
+            .collect();
+        (units, self.serial.clone())
+    }
+
+    /// Times the device came back and was taken again.
+    pub(super) fn returned(&self) -> u32 {
+        self.returned
+    }
+
+    /// Take `transport`, bound to the device after it left the bus and came
+    /// back, when a published unit probed (`probed`) with the identity it
+    /// was published with and its first blocks hold what this owner kept
+    /// of them: the same medium. That unit's disks go on, as after a port
+    /// reset ([`Self::revalidate`]), and every other unit ends. A command
+    /// begun on the old transport ends failed. How many units go on; with
+    /// no unit the same, nothing is taken, and why: the device is another
+    /// one, holds another medium, or its medium could not be compared.
+    pub(super) fn resume(
+        &mut self,
+        transport: T,
+        probed: Vec<Probed<T::Lun>>,
+    ) -> Result<usize, &'static str> {
+        let verdict = |unit: &Unit<T::Lun>| {
+            let Some((_, identified, first)) = probed.iter().find(|(lun, ..)| *lun == unit.lun)
+            else {
+                return Err(OTHER_IDENTITY);
+            };
+            let same = identified.as_ref().is_ok_and(|(identity, removable)| {
+                *removable == unit.removable
+                    && Identity {
+                        features: unit.identity.features,
+                        ..identity.clone()
+                    } == unit.identity
+            });
+            match (first, &unit.first_blocks) {
+                _ if !same => Err(OTHER_IDENTITY),
+                (Some(first), Some(kept)) if first == kept => Ok(()),
+                (Some(_), Some(_)) => Err(OTHER_MEDIUM),
+                _ => Err(UNCHECKED_MEDIUM),
+            }
+        };
+        let verdicts: Vec<Result<(), &'static str>> = self.units.iter().map(verdict).collect();
+        let count = verdicts.iter().filter(|verdict| verdict.is_ok()).count();
+        if count == 0 {
+            // The most telling reason: another medium, then one that could
+            // not be compared, then another device.
+            let why = [OTHER_MEDIUM, UNCHECKED_MEDIUM]
+                .into_iter()
+                .find(|why| verdicts.contains(&Err(why)))
+                .unwrap_or(OTHER_IDENTITY);
+            return Err(why);
+        }
+        for queued in &mut self.commands {
+            if matches!(queued, Some(Queued::Running(..) | Queued::Waiting(_))) {
+                *queued = Some(Queued::Ended(Err(BlockError::Unsupported(
+                    "USB storage device left the bus during the command",
+                ))));
+            }
+        }
+        self.declined = false;
+        for (_, valid, _) in &self.pending {
+            valid.set(false);
+        }
+        self.transport = transport;
+        // The device's power-on UNIT ATTENTION may still be pending.
+        self.expecting_reset = true;
+        self.rebinds += 1;
+        self.returned += 1;
+        for (unit, verdict) in self.units.iter().zip(verdicts) {
+            unit.valid.set(verdict.is_ok());
+        }
+        Ok(count)
+    }
+
+    /// After a device reset, keep each published unit whose probe gives the
+    /// identity it was published with, and end the others.
+    fn revalidate(&mut self) {
+        for (_, valid, _) in &self.pending {
+            valid.set(false);
+        }
+        let serial = self.serial.clone();
+        for index in 0..self.units.len() {
+            let (lun, location) = (
+                self.units[index].lun,
+                self.units[index].identity.location.clone(),
+            );
+            let probed = probe(&mut self.transport, lun, &location, &serial);
+            let unit = &self.units[index];
+            let same = probed.is_ok_and(|(identity, removable)| {
+                removable == unit.removable
+                    && Identity {
+                        features: unit.identity.features,
+                        ..identity
+                    } == unit.identity
+            });
+            if !same || self.transport.poisoned() {
+                unit.valid.set(false);
+            }
+        }
+    }
+}
+impl<T: Scsi> Scsi for Owner<T> {
+    type Lun = T::Lun;
+    fn take_failed_data(&mut self) -> Option<Vec<u8>> {
+        self.transport.take_failed_data()
+    }
+    fn resumable(&self) -> bool {
+        self.transport.resumable()
+    }
+    fn take_failure_status(&mut self) -> Option<String> {
+        let status = self.transport.take_failure_status();
+        self.failure_status.take().or(status)
+    }
+    fn take_reset_failure(&mut self) -> Option<(String, BlockError)> {
+        self.reset_failure.take()
+    }
+    fn command(
+        &mut self,
+        lun: Self::Lun,
+        cdb: &[u8],
+        data: Data<'_>,
+    ) -> Result<Vec<u8>, BlockError> {
+        // Until the write to them completes, the first blocks hold either.
+        let first = self.first_blocks_after(lun, cdb, &data);
+        if first.is_some() {
+            self.keep_first_blocks(lun, None);
+        }
+        let result = self.run(lun, cdb, |transport| transport.command(lun, cdb, data));
+        if result.is_ok()
+            && let Some(Some(first)) = first
+        {
+            self.keep_first_blocks(lun, Some(first));
+        }
+        result
+    }
+    fn read_into(
+        &mut self,
+        lun: Self::Lun,
+        cdb: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), BlockError> {
+        self.run(lun, cdb, |transport| {
+            transport.read_into(lun, cdb, &mut *output)
+        })
+    }
+    fn delay(&mut self, micros: u64) -> Result<(), BlockError> {
+        self.transport.delay(micros)
+    }
+    fn now_us(&self) -> u64 {
+        self.transport.now_us()
+    }
+    fn poisoned(&self) -> bool {
+        self.transport.poisoned()
+    }
+    fn signals(&self) -> bool {
+        self.transport.signals()
+    }
+    /// A command waiting to run again is looked at until it begins.
+    fn posted(&self) -> bool {
+        self.waiting() || self.transport.posted()
+    }
+    fn write_protect_page(&self) -> Option<u8> {
+        self.transport.write_protect_page()
+    }
+    fn caching(&self) -> Caching {
+        self.transport.caching()
+    }
+    fn report_luns_permitted(&self) -> bool {
+        self.transport.report_luns_permitted()
+    }
+    fn generation(&self) -> u64 {
+        self.transport.generation()
+    }
+    fn max_transfer_bytes(&self) -> usize {
+        self.transport.max_transfer_bytes()
+    }
+    fn read_command_ceiling(&self) -> usize {
+        self.transport.read_command_ceiling()
+    }
+    fn capacity16_first(&self) -> bool {
+        self.transport.capacity16_first()
+    }
+    fn adjust_capacity(&self, blocks: u64) -> Option<u64> {
+        self.transport.adjust_capacity(blocks)
+    }
+    fn separate_last_sector(&self) -> bool {
+        self.transport.separate_last_sector()
+    }
+    fn read_before_mode_sense(
+        &mut self,
+        lun: Self::Lun,
+        block_size: usize,
+    ) -> Result<(), BlockError> {
+        self.end_first();
+        let generation = self.transport.generation();
+        let result = self.transport.read_before_mode_sense(lun, block_size);
+        let removable = self.removable(lun);
+        if matches!(&result, Err(BlockError::Sense(sense)) if changed(sense, removable)) {
+            self.changed(lun, sense_of(&result));
+        }
+        self.settle(generation, &result);
+        result
+    }
+    fn media_publication(&mut self, lun: Self::Lun, valid: Rc<Cell<bool>>, removable: bool) {
+        self.pending.push((lun, valid, removable));
+    }
+    fn max_lun(&self) -> u8 {
+        self.transport.max_lun()
+    }
+    fn queued(&self) -> bool {
+        self.transport.queued()
+    }
+    fn depth(&self) -> usize {
+        self.transport.depth()
+    }
+    fn begin(
+        &mut self,
+        lun: Self::Lun,
+        cdb: &[u8],
+        data: Data<'_>,
+    ) -> Option<Result<usize, BlockError>> {
+        if !self.room() {
+            return Some(Err(BlockError::Protocol(
+                "every command tag of the USB storage transport is in use",
+            )));
+        }
+        // A reset no command ended here is no reason to retry this one.
+        self.rebound = false;
+        let handle = self
+            .commands
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.commands.len());
+        let first_blocks = self.first_blocks_after(lun, cdb, &data);
+        let begun = Begun {
+            lun,
+            cdb: cdb.to_vec(),
+            data: Retry::new(&data),
+            generation: self.transport.generation(),
+            attention: true,
+            ladder: Ladder::new(self.transport.now_us()),
+            first_blocks,
+        };
+        Some(self.begin_attempt(handle, begun)?.map(|()| handle))
+    }
+    fn end(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
+        self.end_begun(handle)
+    }
+    fn busy(&mut self) -> bool {
+        self.commands.iter().any(Option::is_some) || self.transport.busy()
+    }
+    /// A command waiting to run again goes first.
+    fn room(&mut self) -> bool {
+        !self.waiting() && self.transport.room()
+    }
+}
+
+fn finish<T: Scsi>(
+    owner: &Rc<RefCell<Owner<T>>>,
+    result: Result<Vec<Disk<Owner<T>>>, BlockError>,
+) -> Result<Vec<Disk<Owner<T>>>, BlockError> {
+    match result {
+        Ok(mut disks) => {
+            let mut owner = owner.borrow_mut();
+            owner.reconcile(&mut disks);
+            owner.pending.clear();
+            Ok(disks)
+        }
+        Err(error) => {
+            let mut owner = owner.borrow_mut();
+            owner.invalidate();
+            owner.pending.clear();
+            Err(error)
+        }
+    }
+}
+fn scan<T: Scsi>(
+    owner: Rc<RefCell<Owner<T>>>,
+    mut discover: impl FnMut() -> Result<Vec<Disk<Owner<T>>>, BlockError>,
+) -> Result<Vec<Disk<Owner<T>>>, BlockError> {
+    for _ in 0..3 {
+        let rebinds = owner.borrow().rebinds;
+        let result = discover();
+        if result.is_err() {
+            return finish(&owner, result);
+        }
+        // A port reset during discovery ended the commands it interrupted,
+        // so their units are probed again, as a changed view is.
+        let unstable = owner.borrow().rebinds != rebinds
+            || owner
+                .borrow()
+                .pending
+                .iter()
+                .any(|(_, valid, _)| !valid.get());
+        if !unstable {
+            return finish(&owner, result);
+        }
+        // A later command invalidated an already-probed view. Discard every
+        // provisional disk and repeat only inventory/readiness/metadata probes.
+        let mut owner = owner.borrow_mut();
+        for (_, valid, _) in &owner.pending {
+            valid.set(false);
+        }
+        owner.pending.clear();
+    }
+    finish(
+        &owner,
+        Err(BlockError::Unsupported(
+            "USB media changed repeatedly during rescan",
+        )),
+    )
+}
+pub(super) fn scan_bot<T: Scsi<Lun = u8>>(
+    owner: Rc<RefCell<Owner<T>>>,
+    failures: &mut Vec<(String, BlockError)>,
+) -> Result<Vec<Disk<Owner<T>>>, BlockError> {
+    let (prefix, serial) = {
+        let o = owner.borrow();
+        (o.prefix.clone(), o.serial.clone())
+    };
+    scan(owner.clone(), || {
+        discover_units(owner.clone(), &prefix, &serial, failures)
+    })
+}
+pub(super) fn scan_uas<T: Scsi<Lun = uas::Lun>>(
+    owner: Rc<RefCell<Owner<T>>>,
+    failures: &mut Vec<(String, BlockError)>,
+) -> Result<Vec<Disk<Owner<T>>>, BlockError> {
+    let (prefix, serial) = {
+        let o = owner.borrow();
+        (o.prefix.clone(), o.serial.clone())
+    };
+    scan(owner.clone(), || {
+        discover_uas_units(owner.clone(), &prefix, &serial, failures)
+    })
+}
+
+/// A configured storage interface kept independently of inserted media.
+/// Clones share the same serialized transport and permanent disk validity.
+#[derive(Clone)]
+pub struct UsbStorage {
+    pub(super) owner: TransportOwner,
+}
+#[derive(Clone)]
+pub(super) enum TransportOwner {
+    Bot(Rc<RefCell<Owner<Bot<Native>>>>),
+    EhciBot(Rc<RefCell<Owner<Bot<EhciBulk>>>>),
+    Uas(Rc<RefCell<Owner<uas::Host>>>),
+}
+impl UsbStorage {
+    /// Whether this interface's transport is on `controller`.
+    pub(in crate::usb) fn on(&self, controller: &Shared) -> bool {
+        match &self.owner {
+            TransportOwner::Bot(owner) => {
+                Rc::ptr_eq(&owner.borrow().transport.io.controller, controller)
+            }
+            TransportOwner::EhciBot(_) => false,
+            TransportOwner::Uas(owner) => owner.borrow().transport.on(controller),
+        }
+    }
+    /// Controller/physical-interface location, including an empty reader.
+    pub fn location(&self) -> String {
+        match &self.owner {
+            TransportOwner::Bot(owner) => owner.borrow().prefix.clone(),
+            TransportOwner::EhciBot(owner) => owner.borrow().prefix.clone(),
+            TransportOwner::Uas(owner) => owner.borrow().prefix.clone(),
+        }
+    }
+    /// Poll LUN inventory/readiness and revalidate current media. The
+    /// caller replaces its disk inventory with this result. Existing aliases
+    /// remain valid only for unchanged media without an observed change event.
+    /// This synchronous operation does not install a polling/hotplug scheduler.
+    pub fn rescan(
+        &mut self,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> Result<Vec<UsbDisk>, BlockError> {
+        match &self.owner {
+            TransportOwner::Bot(owner) => scan_bot(owner.clone(), failures).map(|units| {
+                units
+                    .into_iter()
+                    .map(|disk| UsbDisk {
+                        disk: UsbTransport::Bot(disk),
+                    })
+                    .collect()
+            }),
+            TransportOwner::EhciBot(owner) => scan_bot(owner.clone(), failures).map(|units| {
+                units
+                    .into_iter()
+                    .map(|disk| UsbDisk {
+                        disk: UsbTransport::EhciBot(disk),
+                    })
+                    .collect()
+            }),
+            TransportOwner::Uas(owner) => scan_uas(owner.clone(), failures).map(|units| {
+                units
+                    .into_iter()
+                    .map(|disk| UsbDisk {
+                        disk: UsbTransport::Uas(disk),
+                    })
+                    .collect()
+            }),
+        }
+    }
+    /// One bounded ordinary service pass: poll real media, and replace a
+    /// poisoned transport through acknowledged physical reset and fresh probes.
+    /// Only metadata is reissued; a failed caller data command is never replayed.
+    /// The native event loop must call this method and replace its inventory.
+    pub fn service(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> Result<Vec<UsbDisk>, BlockError> {
+        if self.requires_rebind() {
+            return self.reset_and_rebind(dma, failures);
+        }
+        let result = self.rescan(failures);
+        if result.is_err() && self.requires_rebind() {
+            self.reset_and_rebind(dma, failures)
+        } else {
+            result
+        }
+    }
+    fn requires_rebind(&self) -> bool {
+        match &self.owner {
+            TransportOwner::Bot(owner) => owner.borrow().transport.poisoned(),
+            TransportOwner::EhciBot(owner) => owner.borrow().transport.poisoned(),
+            TransportOwner::Uas(owner) => owner.borrow().transport.requires_rebind(),
+        }
+    }
+    /// Device reset followed by fresh transport, descriptors and media
+    /// probes. This owner keeps the new interface even when no LUN is ready.
+    /// Other copies of the old owner and all its disks remain quarantined.
+    pub fn reset_and_rebind(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> Result<Vec<UsbDisk>, BlockError> {
+        self.owner = match &self.owner {
+            TransportOwner::Bot(old) => {
+                let host = {
+                    let mut old = old.borrow_mut();
+                    old.invalidate();
+                    old.transport.reset_and_rebind(dma)
+                }
+                .map_err(|(operation, error)| {
+                    failures.push((operation, error.clone()));
+                    error
+                })?;
+                let prefix = format!("{} interface {}", host.device().location, host.interface());
+                let serial = String::from(
+                    host.device()
+                        .serial
+                        .as_deref()
+                        .unwrap_or(&host.device().location),
+                );
+                TransportOwner::Bot(Rc::new(RefCell::new(Owner::new(host, prefix, serial))))
+            }
+            TransportOwner::EhciBot(old) => {
+                let mut old = old.borrow_mut();
+                old.invalidate();
+                let host =
+                    old.transport
+                        .reset_and_rebind_ehci()
+                        .map_err(|(operation, error)| {
+                            failures.push((operation, error.clone()));
+                            error
+                        })?;
+                let (prefix, serial) = (old.prefix.clone(), old.serial.clone());
+                TransportOwner::EhciBot(Rc::new(RefCell::new(Owner::new(host, prefix, serial))))
+            }
+            TransportOwner::Uas(old) => {
+                let host = {
+                    let mut old = old.borrow_mut();
+                    old.invalidate();
+                    old.transport.reset_and_rebind(dma)
+                }
+                .map_err(|(operation, error)| {
+                    failures.push((operation, error.clone()));
+                    error
+                })?;
+                let prefix = format!("{} interface {}", host.device().location, host.interface());
+                let serial = String::from(
+                    host.device()
+                        .serial
+                        .as_deref()
+                        .unwrap_or(&host.device().location),
+                );
+                TransportOwner::Uas(Rc::new(RefCell::new(Owner::new(host, prefix, serial))))
+            }
+        };
+        let result = self.rescan(failures);
+        if result.is_err() {
+            match &self.owner {
+                TransportOwner::Bot(owner) => owner.borrow_mut().transport.quarantine(),
+                TransportOwner::EhciBot(owner) => owner.borrow_mut().transport.quarantine(),
+                TransportOwner::Uas(owner) => owner.borrow_mut().transport.quarantine(),
+            }
+        }
+        result
+    }
+}
+impl UsbDisk {
+    /// Keep the configured interface for later rescan, even after removing
+    /// every published disk from the caller's inventory.
+    pub fn storage(&self) -> UsbStorage {
+        UsbStorage {
+            owner: match &self.disk {
+                UsbTransport::Bot(disk) => TransportOwner::Bot(disk.bot.clone()),
+                UsbTransport::EhciBot(disk) => TransportOwner::EhciBot(disk.bot.clone()),
+                UsbTransport::Uas(disk) => TransportOwner::Uas(disk.bot.clone()),
+            },
+        }
+    }
+    /// Recovery variant that preserves the fresh owner even with zero disks.
+    pub fn reset_and_rebind_retained(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> Result<(UsbStorage, Vec<UsbDisk>), BlockError> {
+        let mut owner = self.storage();
+        let disks = owner.reset_and_rebind(dma, failures)?;
+        Ok((owner, disks))
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "oracle: STELA_USB_MEDIA_ORACLE"]
+    fn unchanged_linux_media_helpers_match_all_normalized_sense_profiles() {
+        extern crate std;
+        let trace = std::fs::read(
+            std::env::var("STELA_USB_MEDIA_ORACLE").expect("media helper trace path"),
+        )
+        .unwrap();
+        assert_eq!(trace.len(), 131_072 * 10);
+        for row in trace.as_chunks::<10>().0 {
+            let [
+                key,
+                asc,
+                ascq,
+                valid,
+                removable,
+                present,
+                absent,
+                removed_changed,
+                tur_changed,
+                zero,
+            ] = *row;
+            let sense = Sense { key, asc, ascq };
+            assert_eq!(absent != 0, valid != 0 && no_media(&sense));
+            assert_eq!(removed_changed != 0, absent != 0 && present != 0);
+            assert_eq!(zero != 0, absent != 0 && removable != 0);
+            assert_eq!(tur_changed != 0, valid != 0 && removable != 0 && key == 6);
+            if valid != 0 && removable != 0 {
+                assert_eq!(
+                    changed(&sense, true),
+                    absent != 0 || tur_changed != 0 || key == 5 && asc == 0x25
+                );
+            }
+        }
+    }
+    /// Each write form gives its range; another command that sends data,
+    /// or one that formats, sanitizes or passes ATA through, may write
+    /// anywhere; reads and parameter commands leave the medium.
+    #[test]
+    fn commands_that_write_give_their_range_and_others_are_unknown_or_none() {
+        let out = Data::Out(&[]);
+        assert_eq!(
+            touch(&[0x0a, 0x01, 0x00, 0x02, 0, 0], &out),
+            Touch::Write {
+                lba: 0x1_0002,
+                blocks: 256
+            }
+        );
+        let ten = scsi::read_write(true, false, 1, 3);
+        assert_eq!(
+            touch(ten.as_ref(), &out),
+            Touch::Write { lba: 1, blocks: 3 }
+        );
+        let mut twelve = [0; 12];
+        twelve[0] = 0xaa;
+        twelve[5] = 7;
+        twelve[9] = 2;
+        assert_eq!(touch(&twelve, &out), Touch::Write { lba: 7, blocks: 2 });
+        let sixteen = scsi::read_write(true, true, 1 << 33, 4);
+        assert_eq!(
+            touch(sixteen.as_ref(), &out),
+            Touch::Write {
+                lba: 1 << 33,
+                blocks: 4
+            }
+        );
+        assert_eq!(touch(&[0x15, 0, 0, 0, 12, 0], &out), Touch::None);
+        assert_eq!(touch(&[0x42; 10], &out), Touch::Unknown);
+        assert_eq!(touch(&[0x04, 0, 0, 0, 0, 0], &Data::None), Touch::Unknown);
+        assert_eq!(touch(&[0x85; 16], &Data::None), Touch::Unknown);
+        assert_eq!(touch(&[0x85; 16], &Data::In(512)), Touch::None);
+        let read = scsi::read_write(false, false, 0, 2);
+        assert_eq!(touch(read.as_ref(), &Data::In(1024)), Touch::None);
+        assert_eq!(touch(&scsi::synchronize_cache(), &Data::None), Touch::None);
+    }
+
+    #[test]
+    fn a_hung_uas_command_resets_the_port_and_a_changed_capacity_ends_the_disk() {
+        use crate::block::BlockDevice;
+        use crate::usb::xhci;
+        for speed in [xhci::HIGH_SPEED, xhci::SUPER_SPEED] {
+            let mut memory = vec![0u64; 512 * 1024];
+            // The model's capacity grows with each reset.
+            let (controller, device, hardware, mut dma) =
+                xhci::model::reset_fixture(&mut memory, speed, 32, 3);
+            let binding = uas::Binding::new(
+                &device,
+                &crate::usb::descriptor::interfaces(&device.configuration)[0],
+            )
+            .unwrap();
+            let mut failures = Vec::new();
+            // SAFETY: the fixture grants this owner its one unconfigured interface.
+            let (mut storage, mut disks) = unsafe {
+                super::super::discover_uas_retained(
+                    controller,
+                    &device,
+                    binding,
+                    &mut dma,
+                    &mut failures,
+                )
+            }
+            .unwrap();
+            let before = hardware.borrow().scsi.len();
+            hardware.borrow_mut().hang_next = true;
+            // The hung write poisons the transport and the owner resets the
+            // port at once. The device answers with another capacity, so
+            // the disk ends and the write is not retried.
+            assert!(disks[0].write(1, &[0xaa; 512]).is_err());
+            assert_eq!(hardware.borrow().resets, 1);
+            assert_eq!(
+                hardware.borrow().scsi[before..]
+                    .iter()
+                    .filter(|(_, op)| *op == scsi::WRITE_10)
+                    .count(),
+                1
+            );
+            let accesses = hardware.borrow().accesses;
+            assert!(disks[0].flush_cache().is_err());
+            assert_eq!(hardware.borrow().accesses, accesses);
+            // The rebound transport publishes the new medium.
+            let mut fresh = storage.service(&mut dma, &mut failures).unwrap();
+            assert_eq!(fresh[0].identity().blocks, 2048);
+            assert_eq!(hardware.borrow().resets, 1);
+            hardware.borrow_mut().empty_media = true;
+            assert!(storage.service(&mut dma, &mut failures).unwrap().is_empty());
+            assert!(fresh[0].read(0, &mut [0; 512]).is_err());
+            hardware.borrow_mut().empty_media = false;
+            let mut inserted = storage.service(&mut dma, &mut failures).unwrap();
+            inserted[0].write(1, &[0xbb; 512]).unwrap();
+            let mut bytes = [0; 512];
+            inserted[0].read(1, &mut bytes).unwrap();
+            assert_eq!(bytes, [0xbb; 512]);
+        }
+    }
+
+    /// A unit whose first command at attach never completes, as a stick
+    /// that is not ready yet: one port reset, then the fresh probe publishes
+    /// the disk, with the first attempt's failure kept for the log.
+    #[test]
+    fn a_first_command_that_hangs_at_attach_resets_the_device_and_probes_again() {
+        use crate::usb::xhci;
+        let mut memory = vec![0u64; 512 * 1024];
+        let (controller, device, hardware, mut dma) =
+            xhci::model::reset_fixture(&mut memory, xhci::SUPER_SPEED, 32, 3);
+        let binding = uas::Binding::new(
+            &device,
+            &crate::usb::descriptor::interfaces(&device.configuration)[0],
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        hardware.borrow_mut().hang_next = true;
+        // SAFETY: exclusive fresh fixture interface; no endpoints configured.
+        let (_storage, disks) = unsafe {
+            super::super::discover_uas_retained(
+                controller,
+                &device,
+                binding,
+                &mut dma,
+                &mut failures,
+            )
+        }
+        .unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(hardware.borrow().resets, 1);
+        assert!(!failures.is_empty());
+    }
+
+    #[test]
+    fn service_recovers_poison_observed_during_metadata_scan_once() {
+        use crate::usb::xhci;
+        let mut memory = vec![0u64; 512 * 1024];
+        let (controller, device, hardware, mut dma) =
+            xhci::model::reset_fixture(&mut memory, xhci::HIGH_SPEED, 32, 3);
+        let binding = uas::Binding::new(
+            &device,
+            &crate::usb::descriptor::interfaces(&device.configuration)[0],
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        // SAFETY: exclusive fresh fixture interface; no endpoints configured.
+        let (mut storage, mut disks) = unsafe {
+            super::super::discover_uas_retained(
+                controller,
+                &device,
+                binding,
+                &mut dma,
+                &mut failures,
+            )
+        }
+        .unwrap();
+        hardware.borrow_mut().hang_next = true;
+        assert_eq!(storage.service(&mut dma, &mut failures).unwrap().len(), 1);
+        assert_eq!(hardware.borrow().resets, 1);
+        use crate::block::BlockDevice;
+        assert!(disks[0].read(0, &mut [0; 512]).is_err());
+    }
+}

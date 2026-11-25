@@ -1,0 +1,26 @@
+/target/
+/crates/*/target/
+/*.rcgu.o
+/.stela/
+/.tools
+*.ipsw
+*.dmg
+*.part
+*.part.json
+.DS_Store
+/GOAL.md
+/docs/
+/AGENTS.md
+
+# GoldenOSX-VM runtime caches, logs, and local firmware/image artifacts
+/.mesa-shader-cache/
+/.stela-nir-cache/
+/.stela-guest-ram
+/OVMF_VARS.fd
+/*.log
+/*.efi
+/*.efi.bak
+/vhd_ESP_BOOT.LOG
+/vhd_STELA_*.txt
+/__pycache__/
+/patch_stela_vm4gb*.py

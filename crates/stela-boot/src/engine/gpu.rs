@@ -1,0 +1,3612 @@
+//! The host's Linux environment and the NVIDIA GPUs nouveau drives in it,
+//! which back the guest's Metal device.
+//!
+//! It lives on the boot CPU, and any processor may run it in that CPU's
+//! place, one at a time (`KernelWork::dispatch_linux_moved`). A GPU's MSI
+//! targets the boot CPU, which takes it between slices or when the PE waits,
+//! and only records its line ([`Fired`]). An event wakes a PE whose guest
+//! waits for an interrupt, which holds no guest lock: its idle core runs
+//! what is ready ([`pump_waiting_pe`]). A PE waiting for a call it posted
+//! runs Linux for it itself. The boot PE pumps when no other did ([`pump`]):
+//! like the host's service, it waits for a moment it holds no guest lock,
+//! waiting for an interrupt or at EL0, but only for a bounded time
+//! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
+//! GPU completions are not starved. Nothing reserves a core, and a Linux
+//! environment with nothing to do costs the boot PE one comparison a slice.
+#[cfg(feature = "nvk")]
+pub(super) mod acpi_backlight;
+mod before;
+#[cfg(feature = "nvk")]
+pub(super) mod client;
+#[cfg(feature = "nvk")]
+pub(super) mod display;
+#[cfg(feature = "nvk")]
+mod file;
+#[cfg(feature = "nvk")]
+pub(super) mod gate;
+#[cfg(all(feature = "soft-gpu", not(feature = "nvk")))]
+pub(super) mod soft_gate;
+#[cfg(all(feature = "soft-gpu", not(feature = "nvk")))]
+pub(super) mod vgpu_gate;
+pub(super) mod link;
+/// `xtask guest`'s objects of the StelaGPU kext.
+#[cfg(any(feature = "nvk", feature = "soft-gpu"))]
+mod kext {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/guest/StelaGPU.kext.rs"
+    ));
+}
+#[cfg(feature = "nvk")]
+mod refused;
+#[cfg(feature = "nvk")]
+mod slice;
+#[cfg(feature = "nvk")]
+mod stack;
+#[cfg(feature = "nvk")]
+mod waiter;
+
+use super::{
+    host,
+    kernel_work::{self, KernelPages, KernelWork, SLOTS},
+};
+use crate::{handoff::RtcReading, native_irq, native_memory, native_mmio::Window, output};
+use alloc::{
+    borrow::ToOwned, boxed::Box, collections::BTreeMap, collections::BTreeSet, format, rc::Rc,
+    string::String, sync::Arc, vec::Vec,
+};
+use core::{
+    alloc::Layout,
+    cell::{Cell, RefCell},
+    ffi::{CStr, c_void},
+    mem::ManuallyDrop,
+    ops::Range,
+    pin::Pin,
+    ptr::{self, addr_of},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
+pub(super) use stela_boot_core::linux_pump::Calm;
+use stela_boot_core::linux_pump::{BootPump, Limits, Taker, Turn, Wakes, boot_decision};
+use stela_boot_core::page_window::{self, Cache};
+#[cfg(feature = "nvk")]
+use stela_drivers::gpu::metal::open::PcieLink;
+use stela_drivers::{
+    bus::{
+        irq::{Disposition, Handler, IrqError, IrqRegistration, Route, Source},
+        mmio::owned::{self, CacheAttribute, Mapping, Protection},
+        pci::{
+            Bar, ConfigError, ConfigFailure, ConfigSpace, Function,
+            owned::{ConfigRetention, OwnedConfig},
+        },
+    },
+    firmware::Catalog,
+    gpu::{self, stack::GpuStack},
+    platform::work::{
+        WorkError,
+        service::{Clock, Domain, Idle},
+    },
+    probe::{NativeServices, ServiceError},
+};
+use stela_engine::machine::engine::Hub;
+use stela_linux::{
+    catalogue::{FunctionCustody, PciAuthority, PciFirmware},
+    function::{self, Attached, Msi, Placement, Region},
+    kernel::KernelOwner,
+    owner::{Errno, Platform, RealtimeOrigin, RealtimeRead},
+    random::Seeded,
+    service::Environment as LinuxEnvironment,
+    task::runtime::{ManagedJob, Outcome, TaskRuntime},
+    threads::{KernelThreadPlatform, TaskDataBacking},
+};
+
+type Environment = LinuxEnvironment<SLOTS>;
+type LinuxKernel = KernelOwner<Host, SLOTS>;
+type LinuxThreads = TaskRuntime<Host, KernelPages, SLOTS>;
+
+const PAGE: u64 = page_window::PAGE;
+const EIO: Errno = -5;
+const EFAULT: Errno = -14;
+const ERANGE: Errno = -34;
+const ENODEV: Errno = -19;
+const EINVAL: Errno = -22;
+const ENOMEM: Errno = -12;
+const EOPNOTSUPP: Errno = -95;
+
+const MSI_CAPABILITY: u8 = 5;
+#[cfg(feature = "nvk")]
+const PCIE_CAPABILITY: u8 = 0x10;
+/// `PCI_EXP_LNKSTA`, in the PCIe capability.
+#[cfg(feature = "nvk")]
+const LINK_STATUS: u16 = 0x12;
+#[cfg(feature = "nvk")]
+const REVISION: u16 = 0x08;
+#[cfg(feature = "nvk")]
+const SUBSYSTEM_ID: u16 = 0x2c;
+/// Linux's `IORESOURCE_*` bits of a memory BAR.
+const RESOURCE_MEMORY: u64 = 0x200;
+const RESOURCE_PREFETCHABLE: u64 = 0x2000;
+const RESOURCE_WIDE: u64 = 0x10_0000;
+/// How long the GPUs may take to boot their firmware before the guest starts.
+const START_SECONDS: u64 = 60;
+/// The longest idle wait while they do, which the timeout above is checked at.
+const WAIT_MICROS: u64 = 10_000;
+/// How often a long wait in the start says where it is ([`wait_for_child`]).
+const WAIT_REPORT_SECONDS: u64 = 2;
+/// The longest one pump runs Linux between the boot PE's slices. What is
+/// still runnable stays pending for the next, so a busy driver shares the
+/// boot CPU with the guest and the host's devices instead of holding it.
+const PUMP_NS: u64 = 2_000_000;
+/// The longest a pump on a PE whose guest waits runs Linux, ending sooner
+/// once its guest has work: a guest interrupt waits at most this and the
+/// step running then.
+const WAITING_PUMP_NS: u64 = 1_000_000;
+/// The longest a PE waiting for its own posted call runs Linux at a time
+/// before it lets another processor in.
+#[cfg(feature = "nvk")]
+const POSTER_PUMP_NS: u64 = 1_000_000;
+/// The longest the GPUs' stop waits for a processor in the boot CPU's place
+/// to leave Linux.
+#[cfg(feature = "nvk")]
+const MOVES_CLOSE_NS: u64 = 200_000_000;
+
+/// How long a pump on a waiting PE waits for the host drivers' lock.
+const MOVED_LOCK_WAIT_MICROS: u64 = 50;
+
+/// The processor that pumps now ([`pump_as`]).
+static TURN: Turn = Turn::new();
+/// One wake of a sleeping PE for each episode of held-back work.
+static WAKES: Wakes = Wakes::new();
+
+/// The firmware's ACPI VFCT table, copied while the loader root mapped it:
+/// the video BIOS images firmware publishes for GPUs without an option ROM
+/// of their own (integrated AMD GPUs).
+static VIDEO_BIOS_TABLE: AtomicPtr<Vec<u8>> = AtomicPtr::new(ptr::null_mut());
+
+/// Keeps the ACPI VFCT table for the claims, which give each function its
+/// image in it as the platform ROM Linux's drivers read.
+///
+/// # Safety
+/// `root` is the loader root that maps the ACPI tables at `rsdp`. Called
+/// once, before any claim.
+pub(super) unsafe fn keep_video_bios_table(rsdp: u64, root: u64) {
+    if rsdp == 0 {
+        return;
+    }
+    let table = {
+        // SAFETY: the caller's; the loader root maps every table.
+        let _root = unsafe { super::storage::RestoreRoot::enter(root) };
+        // SAFETY: the firmware's RSDP, whose tables the loader root maps.
+        unsafe { stela_runtime::pc::acpi::find(rsdp, &stela_boot_core::vfct::SIGNATURE) }
+            .ok()
+            .map(<[u8]>::to_vec)
+    };
+    if let Some(table) = table {
+        output::arguments(format_args!(
+            "GPU: the ACPI VFCT table holds {} bytes of video BIOS images\n",
+            table.len()
+        ));
+        VIDEO_BIOS_TABLE.store(Box::into_raw(Box::new(table)), Ordering::Release);
+    }
+}
+
+/// The function's image in the kept VFCT table, as Linux takes it
+/// (`amdgpu_acpi_vfct_bios`), or nothing; a refused image is said once.
+fn platform_rom(adapter: &gpu::Adapter) -> &'static [u8] {
+    use stela_boot_core::vfct;
+    // SAFETY: stored once before any claim and never freed.
+    let Some(table) = (unsafe { VIDEO_BIOS_TABLE.load(Ordering::Acquire).as_ref() }) else {
+        return &[];
+    };
+    let address = adapter.address;
+    let function = vfct::Function {
+        bus: address.bus,
+        device: address.device,
+        function: address.function,
+        vendor: adapter.vendor.pci_id(),
+        device_id: adapter.device,
+    };
+    match vfct::image(table, function) {
+        Ok(image) => {
+            if let Some(bus) = image.renumbered_from {
+                output::arguments(format_args!(
+                    "GPU {address}: its VFCT image names bus {bus:#x}; taken, as Linux takes it\n"
+                ));
+            }
+            output::arguments(format_args!(
+                "GPU {address}: video BIOS of {} bytes from the ACPI VFCT table, given to Linux as its platform ROM\n",
+                image.bytes.len()
+            ));
+            &table[image.bytes]
+        }
+        Err(vfct::Error::NoImage) => &[],
+        Err(error) => {
+            output::arguments(format_args!(
+                "GPU {address}: the ACPI VFCT table's image is refused ({error:?}); the driver looks for its video BIOS elsewhere\n"
+            ));
+            &[]
+        }
+    }
+}
+
+/// Who runs PE work on the boot CPU, once the PEs run.
+static HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
+static BOOT_PE: AtomicUsize = AtomicUsize::new(0);
+/// The processor the environment runs on.
+#[cfg(feature = "nvk")]
+static BOOT_CPU: AtomicU32 = AtomicU32::new(0);
+
+/// End the boot PE's slices for Linux, through `hub`.
+pub(super) fn set_hub(hub: Arc<Hub>, pe: usize) {
+    BOOT_PE.store(pe, Ordering::Relaxed);
+    HUB.store(Arc::into_raw(hub).cast_mut(), Ordering::Release);
+}
+
+/// Calls a PE whose guest sleeps waiting for an interrupt, never the boot
+/// PE, for the GPUs' host work its idle service does at once: Linux's ready
+/// work ([`pump_waiting_pe`]) and a deferred job a guest call waits for
+/// (`gate::run_job` with `Taker::Waiting`). A sleeping PE wakes only for its
+/// guest or the host's service, so the work otherwise waits for the boot
+/// PE's pump or the next PE that stops to wait. Whether one was called;
+/// with none asleep, the caller leaves the work to those. Safe with
+/// interrupts on: the kick writes this processor's ICR with them off.
+fn call_idle_core() -> bool {
+    // SAFETY: a published hub is leaked, so it lives for the boot.
+    let Some(hub) = (unsafe { HUB.load(Ordering::Acquire).as_ref() }) else {
+        return false;
+    };
+    let flags: u64;
+    // SAFETY: CPL0 IF save, restored below on this processor.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    let called = hub.call_sleeping_server(BOOT_PE.load(Ordering::Relaxed));
+    // SAFETY: the save above, on this processor.
+    unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
+    called
+}
+
+/// Calls a core for raised work: a PE whose guest waits for an interrupt
+/// takes it; with none asleep, the boot PE's slice ends, and it pumps by
+/// [`pump_due`]. A woken PE that found guest work first leaves it to the
+/// boot PE's same limits. None while a processor holds the [`TURN`]: a
+/// core called then would find it taken, and the holder takes the work in
+/// its pass or calls a core as it gives the turn back ([`pump_as`]).
+fn call_for_work() {
+    if !TURN.wake_due() {
+        PUMPS.wakes_held.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if may_move() && call_idle_core() {
+        PUMPS.woken.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // SAFETY: a published hub is leaked, so it lives for the boot.
+    if let Some(hub) = unsafe { HUB.load(Ordering::Acquire).as_ref() } {
+        // A kick writes this processor's ICR, which needs interrupts off:
+        // Linux, which raises events too, runs with them on.
+        let flags: u64;
+        // SAFETY: CPL0 IF save, restored below on this processor.
+        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+        hub.call_host(BOOT_PE.load(Ordering::Relaxed));
+        // SAFETY: the save above, on this processor.
+        unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
+    }
+}
+
+/// What wakes the service: a raised line or a call.
+struct Events {
+    clock: crate::native_clock::ClockServices,
+    idle: Arc<dyn Idle>,
+    pending: AtomicBool,
+}
+
+// SAFETY: the native idle owner consumes the software event under its own
+// IRQ exclusion. Publish that event before ringing the boot PE, and use the
+// paired installed clock for each absolute wait.
+unsafe impl Idle for Events {
+    fn clock(&self) -> &Arc<dyn Clock> {
+        self.idle.clock()
+    }
+    fn notify(&self) -> Result<(), WorkError> {
+        let raised = !self.pending.swap(true, Ordering::AcqRel);
+        if raised {
+            PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
+        }
+        self.clock.notify_dispatch();
+        // Only the first event since the last pump wakes a core: later ones
+        // find one already called, and the pump takes them all.
+        if raised {
+            call_for_work();
+        }
+        Ok(())
+    }
+    fn wait_until_ns(&self, deadline: Option<u64>) -> Result<(), WorkError> {
+        let limit = self
+            .idle
+            .clock()
+            .now_ns()?
+            .checked_add(WAIT_MICROS * 1000)
+            .ok_or(WorkError::Exhausted)?;
+        self.idle
+            .wait_until_ns(Some(deadline.map_or(limit, |deadline| deadline.min(limit))))
+    }
+}
+
+unsafe fn allocate_zeroed(layout: Layout) -> *mut u8 {
+    // SAFETY: the registration's contract, which this allocator's one attempt
+    // at its lock meets; the C side frees through the global allocator.
+    unsafe { crate::ALLOCATOR.try_allocate_zeroed(layout) }
+}
+
+/// A function's configuration space, which its MSI source shares with Linux.
+/// The two take turns under the host drivers' lock, which every Linux entry
+/// holds on whichever processor it runs, and the source's route changes run
+/// only in Linux on the boot CPU (`Host::refused_moved`); neither calls out
+/// while it holds it.
+#[derive(Clone)]
+struct SharedConfig(Rc<RefCell<Function<OwnedConfig>>>);
+
+impl ConfigSpace for SharedConfig {
+    fn read32(&self, offset: u16) -> Result<u32, ConfigError> {
+        self.0.borrow_mut().config().read32(offset)
+    }
+    fn write32(&mut self, offset: u16, value: u32) -> Result<(), ConfigError> {
+        self.0.borrow_mut().config().write32(offset, value)
+    }
+    fn read16(&self, offset: u16) -> Result<u16, ConfigError> {
+        self.0.borrow_mut().config().read16(offset)
+    }
+    fn read8(&self, offset: u16) -> Result<u8, ConfigError> {
+        self.0.borrow_mut().config().read8(offset)
+    }
+    fn write16(&mut self, offset: u16, value: u16) -> Result<(), ConfigError> {
+        self.0.borrow_mut().config().write16(offset, value)
+    }
+    fn write8(&mut self, offset: u16, value: u8) -> Result<(), ConfigError> {
+        self.0.borrow_mut().config().write8(offset, value)
+    }
+}
+
+/// The MSI of one function, routed to the boot CPU.
+struct MsiSource {
+    config: SharedConfig,
+    msi: Msi,
+    /// The function the route was attached for, which only it may program.
+    requester: stela_drivers::bus::pci::requester::RequesterId,
+    programmed: bool,
+    event: stela_linux::service::IrqEvent,
+    environment: *const Environment,
+    line: u32,
+}
+
+// SAFETY: the function was stopped when claimed, with no route of its own.
+// Nothing here frees: config/capability stay with the registration. Terminal
+// engine/payload/Linux-work joining is unavailable, so a programmed route's
+// close refuses and retains owners even if nouveau masked its local source.
+unsafe impl Source for MsiSource {
+    fn mask(&mut self) -> Result<(), IrqError> {
+        let command = self.config.read16(4)?;
+        if command == u16::MAX {
+            return Err(IrqError::FailedRead);
+        }
+        self.config.write16(4, command | 1 << 10)?;
+        self.msi.disable(&mut self.config)?;
+        let actual = self.config.read16(4)?;
+        let control = self.msi.control(&self.config)?;
+        if actual == u16::MAX || control == u16::MAX {
+            return Err(IrqError::FailedRead);
+        }
+        if actual & (1 << 10) == 0 || control & 1 != 0 {
+            return Err(IrqError::Mask);
+        }
+        Ok(())
+    }
+    fn quiesce(&mut self) -> Result<(), IrqError> {
+        if self.programmed {
+            // GPU engine/payload and Linux service work have no independent
+            // joined terminal acknowledgement here. Retain the old route.
+            return Err(IrqError::Unsupported);
+        }
+        self.mask()
+    }
+    fn route_kind(&self) -> stela_drivers::bus::irq::RouteKind {
+        stela_drivers::bus::irq::RouteKind::Msi
+    }
+    fn requester(&self) -> Option<&stela_drivers::bus::pci::requester::RequesterId> {
+        Some(&self.requester)
+    }
+    unsafe fn program(
+        &mut self,
+        route: &stela_drivers::bus::irq::AllocatedRoute<'_>,
+    ) -> Result<(), IrqError> {
+        let Route::Msi(message) = route.programming() else {
+            return Err(IrqError::Route);
+        };
+        let data = u16::try_from(message.data).map_err(|_| IrqError::Route)?;
+        self.programmed = true;
+        self.msi
+            .program(&mut self.config, message.address, data)
+            .map_err(IrqError::from)
+    }
+    unsafe fn unmask(&mut self) -> Result<(), IrqError> {
+        self.msi.enable(&mut self.config)?;
+        let control = self.msi.control(&self.config)?;
+        if control == u16::MAX {
+            return Err(IrqError::FailedRead);
+        }
+        if control & 1 == 0 {
+            return Err(IrqError::Mask);
+        }
+        Ok(())
+    }
+    unsafe fn synchronize(&mut self) -> Result<(), IrqError> {
+        unsafe extern "C" {
+            fn stela_linux_irq_actions_joined(irq: u32) -> bool;
+        }
+        // SAFETY: native callback runs below the exact entered Linux owner;
+        // C free_irq retains its closing request and joined work until return.
+        if !unsafe { stela_linux_irq_actions_joined(self.line) } {
+            return Err(IrqError::Drain);
+        }
+        self.event.begin_close();
+        // SAFETY: Registry already closed this exact action and drained native
+        // CPU/inflight/EOI; the original pinned environment/event are retained.
+        unsafe { (&*self.environment).join_irq(&self.event) }.map_err(|_| IrqError::Drain)
+    }
+}
+
+/// The GPU interrupts taken, which the host beat reports.
+static FIRED: AtomicU64 = AtomicU64::new(0);
+
+/// The GPU interrupts taken since boot.
+pub(super) fn interrupts() -> u64 {
+    FIRED.load(Ordering::Relaxed)
+}
+
+/// Records an interrupt for the service task.
+struct Fired {
+    event: stela_linux::service::IrqEvent,
+}
+
+impl Handler for Fired {
+    fn handle(&self) -> Disposition {
+        FIRED.fetch_add(1, Ordering::Relaxed);
+        match self.event.raise() {
+            Ok(()) => Disposition::Handled,
+            Err(_) => Disposition::NotMine,
+        }
+    }
+}
+
+/// A function as Linux's PCI core reaches it.
+struct Device {
+    config: SharedConfig,
+    msi: Option<Msi>,
+    custody: Rc<FunctionCustody>,
+    _views: ManuallyDrop<GpuViews>,
+    _resources: ManuallyDrop<Vec<owned::Resource>>,
+}
+
+impl function::Host for Device {
+    type Config = SharedConfig;
+    fn config(&mut self) -> &mut SharedConfig {
+        &mut self.config
+    }
+    fn enable_msi(&mut self) -> Result<(), function::MsiError> {
+        // The line's route programs it, when nouveau requests its interrupt.
+        self.msi
+            .map(|_| ())
+            .ok_or(function::MsiError::Native(EOPNOTSUPP))
+    }
+    fn disable_msi(&mut self) -> Result<(), function::MsiError> {
+        if let Some(msi) = self.msi {
+            msi.disable(&mut self.config)?;
+        }
+        Ok(())
+    }
+}
+
+/// An interrupt line Linux knows a function by, its index in `Host::lines`.
+struct Line {
+    config: SharedConfig,
+    msi: Option<Msi>,
+    custody: Rc<FunctionCustody>,
+    registration: Option<Box<dyn IrqRegistration>>,
+    retired: Option<stela_drivers::bus::irq::RetiredSource<dyn Source>>,
+}
+
+/// What Linux code gets from Stela.
+struct Host {
+    work: &'static KernelWork,
+    task_data: Arc<dyn TaskDataBacking>,
+    tsc_hz: u64,
+    clock: crate::native_clock::CounterEpoch,
+    realtime: Option<RealtimeOrigin>,
+    window: &'static Window,
+    image: Arc<kernel_work::ReadOnlyImage>,
+    random: RefCell<Seeded>,
+    environment: Cell<*const Environment>,
+    /// The memory BARs Stela claimed, which are all Linux may map.
+    bars: Vec<Range<u64>>,
+    /// Device mappings' sizes in pages, by address.
+    devices: RefCell<BTreeMap<u64, usize>>,
+    lines: RefCell<Vec<Line>>,
+    /// The unsupported operations already reported.
+    reported: RefCell<BTreeSet<String>>,
+    /// The first error Linux reported, which a stop before the start
+    /// finished names as the reason the GPU did not start.
+    first_error: RefCell<Option<String>>,
+    /// What GSP-RM said about its start, which that reason then names.
+    gsp_start: RefCell<stela_boot_core::gpu_status::GspStart>,
+}
+
+impl Host {
+    fn environment(&self) -> Pin<&Environment> {
+        // SAFETY: set before any task runs, to a pinned box kept for the boot.
+        unsafe { Pin::new_unchecked(&*self.environment.get()) }
+    }
+
+    fn map(&self, pages: usize, frame: impl Fn(u64) -> u64, cache: Cache) -> Option<*mut c_void> {
+        let address = self.window.reserve(pages)?;
+        for page in 0..pages as u64 {
+            if !self
+                .window
+                .install(address + page * PAGE, frame(page), cache)
+            {
+                self.unmap(address, pages);
+                return None;
+            }
+        }
+        Some(address as *mut c_void)
+    }
+
+    fn unmap(&self, address: u64, pages: usize) {
+        // A processor that kept the translation keeps the addresses too.
+        if self.window.remove(address, pages) {
+            self.window.release(address, pages);
+        }
+    }
+
+    fn report(&self, line: core::fmt::Arguments<'_>) {
+        output::arguments(format_args!("LINUX {line}\n"));
+    }
+
+    /// Whether Linux runs on a processor in the boot CPU's place, which
+    /// refuses `operation`: interrupt routes are the boot CPU's, and the
+    /// GPUs' stop, which changes them, closes moves first (`close_moves`).
+    /// Reported once.
+    fn refused_moved(&self, operation: &str) -> bool {
+        if !host::moved_here() {
+            return false;
+        }
+        if self
+            .reported
+            .borrow_mut()
+            .insert(format!("moved {operation}"))
+        {
+            self.report(format_args!(
+                "unsupported: {operation} on a processor in the boot CPU's place; refused"
+            ));
+        }
+        true
+    }
+}
+
+// SAFETY: work owns the original queue, code and root. Its live dispatcher
+// scope authenticates the same CPU and loader root for each bounded loan.
+// task_data separately pins the original writable image and heap generation.
+unsafe impl KernelThreadPlatform for Host {
+    fn task_data_backing(&self) -> Result<Arc<dyn TaskDataBacking>, WorkError> {
+        Ok(self.task_data.clone())
+    }
+
+    unsafe fn with_process<R>(
+        &self,
+        body: impl FnOnce(&dyn stela_drivers::platform::work::EnteredProcess) -> R,
+    ) -> Result<R, WorkError> {
+        // SAFETY: the caller supplies the bounded, non-switching metadata leaf.
+        unsafe { self.work.with_linux_process(body) }
+    }
+}
+
+impl Platform for Host {
+    fn calibrated_tsc_hz(&self) -> Option<core::num::NonZeroU64> {
+        core::num::NonZeroU64::new(self.tsc_hz)
+    }
+
+    fn now_ns(&self) -> i64 {
+        let sample = self.clock.now_ns().and_then(|now| {
+            i64::try_from(now)
+                .ok()
+                .filter(|&now| now != i64::MAX)
+                .ok_or(WorkError::Exhausted)
+        });
+        sample.unwrap_or_else(|error| output::fatal(format_args!("Linux clock failed: {error}")))
+    }
+
+    fn boottime_ns(&self) -> Result<u64, WorkError> {
+        // The retained native counter epoch starts before Linux starts, and
+        // its admission excludes suspend. Both Linux clocks share this epoch.
+        self.clock.now_ns()
+    }
+
+    fn realtime_at(&self, ns: i64, read: RealtimeRead) -> Option<(i64, u32)> {
+        self.realtime.as_ref()?.read(ns, read)
+    }
+
+    fn minimum_delay_us(&self, minimum: u64) -> Result<(), WorkError> {
+        self.clock.minimum_delay_us(minimum)
+    }
+
+    fn minimum_deadline_us(
+        &self,
+        minimum: u64,
+    ) -> Result<Box<dyn stela_linux::owner::MinimumDeadline>, WorkError> {
+        let nanoseconds = minimum.checked_mul(1000).ok_or(WorkError::Exhausted)?;
+        Ok(Box::new(self.clock.minimum_deadline(nanoseconds)?))
+    }
+
+    fn log(&self, level: i32, message: &CStr) {
+        // A line Linux prints is progress: a long step that reports it is
+        // not stuck.
+        super::step_watchdog::progress();
+        let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
+        self.report(format_args!("<{level}> {message}"));
+        #[cfg(feature = "nvk")]
+        gate::driver_line(message);
+        // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.
+        self.gsp_start.borrow_mut().observe(message);
+        if (1..=3).contains(&level) {
+            let mut first = self.first_error.borrow_mut();
+            if first.is_none() {
+                *first = Some(message.to_owned());
+            }
+        }
+    }
+
+    fn fatal(&self, message: &CStr) {
+        // A named stop in place of the C caller's trap, which the engine
+        // would report as an unexpected exception.
+        let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
+        // Before the start finished, its first error is why the GPU did not
+        // start; after it, an error is a running GPU's and names nothing.
+        let (failed_start, firmware) = match installed() {
+            None => (
+                self.first_error.borrow().clone(),
+                self.gsp_start.borrow().failure(),
+            ),
+            Some(_) => (None, None),
+        };
+        output::fatal(stela_boot_core::gpu_status::driver_stopped(
+            message,
+            failed_start.as_deref(),
+            firmware.as_deref(),
+        ))
+    }
+
+    fn warn(&self, file: &CStr, line: i32, condition: Option<&CStr>) {
+        let file = file.to_str().unwrap_or("(not UTF-8)");
+        let condition = condition.and_then(|text| text.to_str().ok()).unwrap_or("");
+        self.report(format_args!("WARN {file}:{line} {condition}"));
+    }
+
+    fn unsupported(&self, operation: &CStr) {
+        let operation = operation.to_str().unwrap_or("(not UTF-8)");
+        if self.reported.borrow_mut().insert(operation.to_owned()) {
+            self.report(format_args!("unsupported: {operation}"));
+        }
+    }
+
+    fn random_bytes(&self, bytes: &mut [u8]) {
+        self.random.borrow_mut().fill(bytes);
+    }
+
+    fn mix_random(&self, bytes: &[u8]) -> bool {
+        self.random.borrow_mut().mix(host::rdtsc(), bytes);
+        true
+    }
+
+    fn timer_changed(&self) -> Result<(), WorkError> {
+        // SAFETY: after publication this points to the original pinned
+        // environment, kept for the boot. A prepublication call is refused.
+        let environment =
+            unsafe { self.environment.get().as_ref() }.ok_or(WorkError::Unavailable)?;
+        environment.timer_changed()
+    }
+
+    fn shutdown(&self, force: bool) {
+        super::service::request_shutdown(force);
+    }
+
+    fn map_device(&self, physical: u64, size: usize, write_combining: bool) -> Option<*mut c_void> {
+        let end = physical.checked_add(size as u64)?;
+        if !self
+            .bars
+            .iter()
+            .any(|bar| bar.start <= physical && end <= bar.end)
+        {
+            return None;
+        }
+        let pages = size / PAGE as usize;
+        let cache = if write_combining {
+            Cache::WriteCombining
+        } else {
+            Cache::Uncached
+        };
+        let address = self.map(pages, |page| physical + page * PAGE, cache)?;
+        self.devices.borrow_mut().insert(address as u64, pages);
+        Some(address)
+    }
+
+    unsafe fn unmap_device(&self, address: *mut c_void) {
+        let pages = self.devices.borrow_mut().remove(&(address as u64));
+        if let Some(pages) = pages {
+            unmapped(Unmapped::Device);
+            // Device memory never becomes RAM, and Linux drops the mapping
+            // with its last use: its shootdown waits for others'. Page
+            // tables nouveau frees cost one iounmap each.
+            self.window.remove_lazily(address as u64, pages);
+        }
+    }
+
+    fn map_pages(&self, physical: &[u64]) -> Option<*mut c_void> {
+        self.map(
+            physical.len(),
+            |page| physical[page as usize],
+            Cache::WriteBack,
+        )
+    }
+
+    unsafe fn unmap_pages(&self, address: *mut c_void, count: usize) {
+        unmapped(Unmapped::Pages);
+        self.unmap(address as u64, count);
+    }
+
+    fn irq_enable(&self, irq: u32) -> Result<(), stela_linux::owner::IrqEnableError> {
+        use stela_linux::owner::IrqEnableError;
+        if self.refused_moved("irq_enable") {
+            // SAFETY: refused before any route, event or source.
+            return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) });
+        }
+        // Refuse a foreign native execution context before classifying any
+        // owner return; no errno itself proves a clean unpublished attempt.
+        let controller = native_irq::service().map_err(|_| IrqEnableError::retained(ENODEV))?;
+        let mut lines = self.lines.borrow_mut();
+        let Some(line) = lines.get_mut(irq as usize) else {
+            // SAFETY: checked original process, before any route/event/source.
+            return Err(unsafe { IrqEnableError::unexposed(EINVAL) });
+        };
+        if line.retired.is_some() {
+            return Err(IrqEnableError::retained(EOPNOTSUPP));
+        }
+        if let Some(registration) = &mut line.registration {
+            return registration
+                .unmask()
+                .map_err(|_| IrqEnableError::retained(EIO));
+        }
+        let Some(msi) = line.msi else {
+            // SAFETY: no native attempt or service epoch was issued.
+            return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) });
+        };
+        // The attachment's own route: its root decides how messages arrive.
+        // SAFETY: a short borrow on the original process; nothing reenters.
+        let route = match unsafe {
+            line.custody
+                .with_native(|attachment| attachment.irq_route())
+        } {
+            Ok(Ok(route)) => route,
+            // SAFETY: no route, event or source was issued.
+            _ => return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) }),
+        };
+        // SAFETY: actual original entered process; any preceding epoch joined.
+        let event = unsafe { self.environment().irq_epoch(irq) }
+            .map_err(|_| IrqEnableError::retained(EIO))?;
+        let source = Box::new(MsiSource {
+            config: line.config.clone(),
+            msi,
+            requester: line.custody.requester().clone(),
+            programmed: false,
+            event: event.clone(),
+            environment: self.environment.get(),
+            line: irq,
+        });
+        let handler = Arc::new(Fired {
+            event: event.clone(),
+        });
+        match controller.request(stela_drivers::bus::irq::Request {
+            source,
+            handler,
+            routing: stela_drivers::bus::irq::RouteRequest::Msi(route),
+        }) {
+            Ok(registration) => {
+                line.registration = Some(registration);
+                Ok(())
+            }
+            Err(refusal) => {
+                let errno = match refusal.error {
+                    stela_drivers::bus::irq::IrqError::Exhausted => ENOMEM,
+                    stela_drivers::bus::irq::IrqError::Unavailable => ENODEV,
+                    stela_drivers::bus::irq::IrqError::Unsupported
+                    | stela_drivers::bus::irq::IrqError::Delivery(
+                        stela_drivers::bus::irq::posted_msi::Error::RootUnavailable
+                        | stela_drivers::bus::irq::posted_msi::Error::Unsupported,
+                    ) => EOPNOTSUPP,
+                    _ => EIO,
+                };
+                if errno == EOPNOTSUPP {
+                    self.unsupported(c"interrupt notification admission");
+                } else {
+                    self.report(format_args!("interrupt {irq} refused: {refusal:?}"));
+                }
+                let Some(untouched) = refusal.returned else {
+                    return Err(IrqEnableError::retained(EIO));
+                };
+                // SAFETY: actual checked prepublication return; extraction
+                // repeats the original process/context/provider checks.
+                let (source, handler, routing) =
+                    unsafe { untouched.into_parts() }.map_err(|_| IrqEnableError::retained(EIO))?;
+                // Retain actual inputs before any fallible cancellation/join.
+                let mut source = core::mem::ManuallyDrop::new(source);
+                let mut handler = core::mem::ManuallyDrop::new(handler);
+                let stela_drivers::bus::irq::RouteRequest::Msi(route) = routing else {
+                    return Err(IrqEnableError::retained(EIO));
+                };
+                // SAFETY: a short borrow on the original process; the grant
+                // was never published, and a failed cancel keeps it retained.
+                let cancelled = unsafe {
+                    line.custody.with_native(|attachment| {
+                        // A failed cancel hands the grant back; keep it.
+                        attachment
+                            .cancel_unpublished_irq(route)
+                            .map_err(core::mem::forget)
+                            .is_ok()
+                    })
+                };
+                if cancelled != Ok(true) {
+                    return Err(IrqEnableError::retained(EIO));
+                }
+                event.begin_close();
+                // SAFETY: RequestError returned actual untouched owners before
+                // Slot/root/source publication, so this new event has no native
+                // callback producer. Join still checks exact epoch/activity.
+                unsafe { self.environment().join_irq(&event) }
+                    .map_err(|_| IrqEnableError::retained(EIO))?;
+                // SAFETY: same original process, unused route canceled and exact
+                // new service epoch actually joined; no C action reachability.
+                unsafe {
+                    core::mem::ManuallyDrop::drop(&mut source);
+                    core::mem::ManuallyDrop::drop(&mut handler);
+                }
+                // SAFETY: all original return/cancel/join facts above, not errno.
+                Err(unsafe { IrqEnableError::unexposed(errno) })
+            }
+        }
+    }
+
+    fn irq_disable(&self, irq: u32) -> Result<(), Errno> {
+        if self.refused_moved("irq_disable") {
+            return Err(EOPNOTSUPP);
+        }
+        let mut lines = self.lines.borrow_mut();
+        let line = lines.get_mut(irq as usize).ok_or(EINVAL)?;
+        match &mut line.registration {
+            Some(registration) => registration.mask().map_err(|_| EIO),
+            None => Ok(()),
+        }
+    }
+    fn irq_retire(&self, irq: u32) -> Result<(), Errno> {
+        if self.refused_moved("irq_retire") {
+            return Err(EOPNOTSUPP);
+        }
+        let mut lines = self.lines.borrow_mut();
+        let line = lines.get_mut(irq as usize).ok_or(EINVAL)?;
+        if line.retired.is_some() {
+            return Err(EOPNOTSUPP);
+        }
+        let Some(registration) = line.registration.as_mut() else {
+            return Ok(());
+        };
+        match registration.retire() {
+            Err(error) => {
+                self.report(format_args!("interrupt {irq} action retained: {error:?}"));
+                Err(EOPNOTSUPP)
+            }
+            Ok(retired) => {
+                // GPU has no original endpoint/entry delivery factory or
+                // custody transfer yet. Do not return completed free_irq from
+                // a future partial source implementation; keep typed owners.
+                line.retired = Some(retired);
+                Err(EOPNOTSUPP)
+            }
+        }
+    }
+
+    unsafe fn copy_from_user(&self, to: *mut u8, from: *const u8, size: usize) -> usize {
+        // SAFETY: clients are in-process, so their addresses are ordinary
+        // valid memory by the caller's contract.
+        unsafe { ptr::copy_nonoverlapping(from, to, size) };
+        0
+    }
+
+    unsafe fn copy_to_user(&self, to: *mut u8, from: *const u8, size: usize) -> usize {
+        // SAFETY: as in `copy_from_user`.
+        unsafe { ptr::copy_nonoverlapping(from, to, size) };
+        0
+    }
+
+    unsafe fn copy_from_kernel_nofault(
+        &self,
+        to: *mut u8,
+        from: *const u8,
+        size: usize,
+    ) -> Result<(), Errno> {
+        if native_irq::current_context() != Ok(None) {
+            return Err(EFAULT);
+        }
+        let heap = native_memory::SOURCE.registration();
+        let in_heap = heap.generation != 0
+            && from
+                .addr()
+                .checked_sub(heap.cpu)
+                .is_some_and(|offset| offset <= heap.bytes && size <= heap.bytes - offset);
+        if !in_heap && !self.image.contains_range(from.addr(), size) {
+            return Err(ERANGE);
+        }
+        if from.addr().abs_diff(to.addr()) < size {
+            return Err(EINVAL);
+        }
+        // SAFETY: the retained heap or immutable image owns the full source
+        // range. The engine host IDT is active on this CPU, and the C caller
+        // owns the disjoint writable destination.
+        if unsafe { stela_boot_core::nofault_read::read(to, from, size) } == 0 {
+            Ok(())
+        } else {
+            Err(EFAULT)
+        }
+    }
+
+    fn available_page_frames(&self, start: usize, pages: usize) -> Result<usize, Errno> {
+        if native_irq::current_context() != Ok(None) {
+            return Err(EFAULT);
+        }
+        let heap = native_memory::SOURCE.registration();
+        let bytes = pages
+            .checked_mul(stela_boot_core::native_memory::PAGE)
+            .ok_or(ERANGE)?;
+        let end = start.checked_add(bytes).ok_or(ERANGE)?;
+        if heap.generation == 0 || start < heap.cpu || end - heap.cpu > heap.bytes {
+            return Err(ERANGE);
+        }
+        Ok(crate::ALLOCATOR.available_page_frames_in(start..end))
+    }
+
+    fn map_user(&self, space: *mut c_void, address: u64, pfn: u64, prot: u64) -> Result<(), Errno> {
+        if !space.is_null() {
+            return Err(EOPNOTSUPP);
+        }
+        let entry = page_window::client_leaf(pfn, prot).ok_or(EINVAL)?;
+        if self.window.install_client(address, entry) {
+            Ok(())
+        } else {
+            Err(ENOMEM)
+        }
+    }
+
+    fn unmap_user(&self, space: *mut c_void, address: u64, size: usize) -> Result<(), Errno> {
+        if !space.is_null() {
+            return Err(EOPNOTSUPP);
+        }
+        if self.window.remove(address, size / PAGE as usize) {
+            Ok(())
+        } else {
+            Err(EIO)
+        }
+    }
+}
+
+/// The original pre-reset register observation and configuration epoch.
+struct GpuViews {
+    config: ConfigRetention,
+    pci_words: [u32; 8],
+    registers: Mapping,
+    /// Register 0 as it read before the reset, where it identifies the chip
+    /// and so reads the same after it. None: it is read and not compared.
+    identity: Option<u32>,
+}
+
+fn gpu_pci_words(function: &mut Function<OwnedConfig>) -> Result<[u32; 8], ConfigError> {
+    // Identity and class/revision, then all six restored BAR registers.
+    let mut words = [0; 8];
+    for (word, offset) in words
+        .iter_mut()
+        .zip([0, 8, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24])
+    {
+        *word = function.config().read32(offset)?;
+    }
+    Ok(words)
+}
+
+// SAFETY: the exclusive original preparation owns this exact configuration
+// and register BAR. Any original GOP writers were joined before BAR sizing,
+// and its terminal admission remains closed. This checks the same retained
+// epoch and reads a harmless UC register on this function after the CPU fence,
+// completing its posted writes before Cold is allowed to reset it.
+unsafe impl gpu::cold::Views<OwnedConfig> for GpuViews {
+    fn seal(&mut self, function: &mut Function<OwnedConfig>) -> Result<(), gpu::cold::ViewError> {
+        self.check(function)
+    }
+}
+
+impl GpuViews {
+    fn check(&self, function: &mut Function<OwnedConfig>) -> Result<(), gpu::cold::ViewError> {
+        use gpu::cold::ViewError;
+        if !function
+            .config()
+            .matches_retention(&self.config)
+            .map_err(|_| ViewError::Context)?
+        {
+            return Err(ViewError::ForeignSource);
+        }
+        if function
+            .config()
+            .read16(4)
+            .map_err(|_| ViewError::RegisterReadback)?
+            & 2
+            == 0
+            || gpu_pci_words(function).map_err(|_| ViewError::RegisterReadback)? != self.pci_words
+        {
+            return Err(ViewError::RegisterReadback);
+        }
+        // The read is what orders the CPU's posted writes before the reset.
+        let read = self.registers.read32(0);
+        if read.is_err() || self.identity.is_some_and(|identity| read != Ok(identity)) {
+            return Err(ViewError::RegisterReadback);
+        }
+        Ok(())
+    }
+}
+
+/// A function claimed from probe, before Linux sees it.
+pub(super) struct Claimed {
+    /// Whether this GPU may be the one showing the firmware's screen.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    shows_screen: bool,
+    device: Device,
+    firmware: PciFirmware,
+    /// The words of Linux's command line its driver needs for it.
+    parameters: Option<String>,
+    /// Other functions its driver searches for, published before it.
+    searched: Vec<stela_linux::function::Identity>,
+    placement: Placement,
+    bars: Vec<Range<u64>>,
+    name: String,
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
+    stack: &'static GpuStack,
+    /// Whether it is integrated as its kernel driver's table says before the
+    /// probe ([`stela_drivers::gpu::stack::Kernel::table_integrated`]).
+    #[cfg(feature = "nvk")]
+    integrated: Option<bool>,
+    #[cfg(feature = "nvk")]
+    drm: client::DrmDevice,
+    #[cfg(feature = "nvk")]
+    link: Option<PcieLink>,
+    /// The PCI Express port above it, read for the link's lines.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read at a loss"))]
+    port: Option<link::Port>,
+}
+
+fn claim(
+    services: &dyn NativeServices,
+    (stack, adapter): (&'static GpuStack, &gpu::Adapter),
+    isa_bridges: &[stela_drivers::probe::IsaBridge],
+    line: u32,
+    gop: crate::pci_io::ScreenOwner,
+    catalog: Arc<Catalog>,
+    port: Option<link::Port>,
+) -> Result<Claimed, ServiceError> {
+    use crate::pci_io::ScreenOwner;
+    let address = adapter.address;
+    let before = before::of(stack).ok_or(ServiceError::Refused(
+        "the boot has no preparation for this GPU's kernel driver",
+    ))?;
+    // A GPU whose driver lacks its files is refused before anything of it
+    // changes, the firmware's screen included.
+    (before.admits)(adapter, &catalog)?;
+    let timer = services.minimum_delay()?;
+    let mut requester = services.prepare_requester(address)?;
+    let bus_reset = requester.bus_reset_available();
+    let function = requester.function_mut();
+    if (function.vendor, function.device, function.class)
+        != (stack.vendor.pci_id(), adapter.device, adapter.class)
+    {
+        return Err(ServiceError::Refused("the GPU's original identity changed"));
+    }
+    let translated = services.dma_translated(address);
+    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
+        .map_err(|error| cold_refusal(address, error))?;
+    let owns_screen = match gop {
+        ScreenOwner::Function(source) if source.address == address => {
+            source.bar.words().try_for_each(|(offset, expected)| {
+                let observed = function
+                    .config()
+                    .read32(offset)
+                    .map_err(ServiceError::Config)?;
+                if observed != expected {
+                    return Err(ServiceError::Config(ConfigError::before_effect(
+                        ConfigFailure::Readback {
+                            offset,
+                            width: 4,
+                            expected,
+                            observed,
+                        },
+                    )));
+                }
+                Ok(())
+            })?;
+            true
+        }
+        // A GPU below a bridge that forwards none of the screen cannot hold
+        // it; any other may show it, so none starts beside its writer.
+        ScreenOwner::Unknown(apart) => {
+            let may = stela_boot_core::firmware_screen::gpu_may_show(
+                &apart,
+                address.segment,
+                address.bus,
+            );
+            if !may {
+                output::arguments(format_args!(
+                    "GPU {address}: the firmware's screen lies outside the bridge windows \
+                     above it, so it stays with the adapter showing it\n"
+                ));
+            }
+            may
+        }
+        ScreenOwner::Function(_) | ScreenOwner::NoScreen => false,
+    };
+    // BAR sizing below temporarily turns off memory decode.
+    if owns_screen && !crate::console::retire_firmware() {
+        return Err(ServiceError::Refused(
+            "a firmware framebuffer writer is still active",
+        ));
+    }
+    // A refusal from here until the GPU is sealed for its reset leaves what
+    // it scans out as it was, so the firmware's screen is given back.
+    let screen = RetiredScreen {
+        address,
+        retired: owns_screen,
+    };
+    let mut placement = Placement {
+        bus: address.bus,
+        devfn: address.device << 3 | address.function,
+        irq: line,
+        // A mapping past the driver's mask is refused
+        // (`function::Mappings`), not truncated.
+        dma_limit: stack.kernel.dma_limit(adapter),
+        rom: platform_rom(adapter),
+        ..Placement::default()
+    };
+    let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
+    let function_bars = function.bars().map_err(ServiceError::Config)?;
+    let register_bar = stack.kernel.registers;
+    if let Err(why) = gpu::cold::register_bar(function_bars[register_bar], PAGE) {
+        output::arguments(format_args!(
+            "GPU {address} register BAR refused: {why:?} BAR{register_bar}={:?}\n",
+            function_bars[register_bar]
+        ));
+        return Err(ServiceError::Refused(
+            "the GPU's register BAR is not an assigned register window",
+        ));
+    }
+    // The register BAR's resource, among those of the memory BARs.
+    let mut registers_at = 0;
+    for (index, (region, bar)) in placement.regions.iter_mut().zip(function_bars).enumerate() {
+        let Some(
+            bar @ Bar::Memory {
+                address: start,
+                size,
+                prefetchable,
+                wide,
+            },
+        ) = bar
+        else {
+            continue;
+        };
+        let resource = services.bar_resource(address, bar)?;
+        let physical = resource.physical_span();
+        if physical.start() != start || physical.bytes() != size {
+            return Err(ServiceError::Refused(
+                "the GPU BAR is translated by the host bridge",
+            ));
+        }
+        if index == register_bar {
+            registers_at = resources.len();
+        }
+        resources.push(resource);
+        bars.push(start..start + size);
+        *region = Region {
+            start,
+            size,
+            flags: RESOURCE_MEMORY
+                | if prefetchable {
+                    RESOURCE_PREFETCHABLE
+                } else {
+                    0
+                }
+                | if wide { RESOURCE_WIDE } else { 0 },
+        };
+    }
+    // Each memory BAR lies in a host aperture: decode it, as Linux
+    // `pci_enable_device` does before the register reads below.
+    let decode = gpu::cold::enable_decode(function, timer.as_ref()).map_err(|error| {
+        output::arguments(format_args!(
+            "GPU {address} memory decoding refused: {error:?}\n"
+        ));
+        ServiceError::Refused("the GPU's memory decoding did not turn on")
+    })?;
+    if decode.power_state != 0 || decode.memory_was_off {
+        output::arguments(format_args!(
+            "GPU {address}: firmware left it in D{} with memory decoding {}; brought to D0 with decoding on, as Linux pci_enable_device does\n",
+            decode.power_state,
+            if decode.memory_was_off { "off" } else { "on" }
+        ));
+    }
+    link::log_link(
+        address,
+        "as the firmware left it",
+        &*function.config(),
+        port.as_ref(),
+    );
+    // Before the reset, which saves the GPU's side as set here and puts it
+    // back, as Linux sets a link at enumeration before its driver resets.
+    // SAFETY: the cold owner of `address` its fabric promoted, in D0 since
+    // `enable_decode`, Bus Master sealed by its preparation; the fabric
+    // keeps every other configuration writer out.
+    unsafe { link::set_substates(address, function, port.as_ref()) };
+    let config = function
+        .config()
+        .retain_epoch()
+        .map_err(ServiceError::Mapping)?;
+    let pci_words = gpu_pci_words(function).map_err(ServiceError::Config)?;
+    let registers = services
+        .authority()?
+        .map(
+            resources[registers_at].clone(),
+            0,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadOnly,
+        )
+        .map_err(ServiceError::Mapping)?;
+    let identified = (before.identify)(
+        before::Observed {
+            services,
+            adapter,
+            isa_bridges,
+            function,
+            registers: &registers,
+        },
+        catalog,
+    )?;
+    if let Some(chip) = identified.chip {
+        crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip);
+    }
+    crate::host_inventory::text(
+        alloc::format!("GPU{line}PCIID"),
+        alloc::format!("{:04x}:{:04x}", stack.vendor.pci_id(), adapter.device),
+    );
+    let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
+        requester,
+        views: GpuViews {
+            config,
+            pci_words,
+            registers,
+            identity: identified.identity,
+        },
+        timer,
+    });
+    if translated {
+        // SAFETY: the mount's active remapper translates this requester, and
+        // its private domain is the one the cold attempt binds.
+        cold = unsafe { cold.translated() };
+    }
+    // The seal and the reset below end the firmware's picture on this GPU.
+    screen.spend();
+    let ready = cold
+        .quiesce_and_bind()
+        .map_err(|failure| cold_refusal(address, failure.error))?;
+    // The BARs as firmware sized them, which the reset kept: a BAR as large
+    // as the GPU's memory is a Resizable BAR firmware enabled.
+    let sizes: Vec<(usize, u64)> = placement
+        .regions
+        .iter()
+        .enumerate()
+        .filter(|(_, region)| region.size != 0)
+        .map(|(index, region)| (index, region.size))
+        .collect();
+    let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
+    // A driver that resets the GPU itself has not yet: the BARs are firmware's.
+    let reset = matches!(
+        ready.reset(),
+        Some(gpu::cold::Reset::SecondaryBus | gpu::cold::Reset::Function(_))
+    );
+    match ready.reset() {
+        None => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
+        )),
+        Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
+        )),
+        Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
+            "GPU {address}: no reset at claim; {} resets it itself; {sizes}\n",
+            stack.kernel.driver
+        )),
+        Some(gpu::cold::Reset::Function(method)) => {
+            let name = match method {
+                stela_drivers::bus::pci::ResetMethod::FunctionLevel => "Function Level Reset",
+                stela_drivers::bus::pci::ResetMethod::PowerManagement => {
+                    "a D3hot to D0 power state reset"
+                }
+            };
+            output::arguments(format_args!(
+                "GPU {address}: reset by {name}; kept {sizes}\n"
+            ));
+        }
+    }
+    // SAFETY: both original owners transfer into this retained function
+    // lifetime before Linux probe. Only the temporary UC observation is retired.
+    let (bound, views) = unsafe { ready.into_parts() };
+    let attachment = ManuallyDrop::new(bound.attachment);
+    let mut function = ManuallyDrop::new(bound.requester.into_function());
+    if reset {
+        resized_bars(address, &function, &mut placement, &mut bars);
+    }
+    let mut views = ManuallyDrop::new(views);
+    views
+        .check(&mut function)
+        .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
+    if reset {
+        link::log_link(
+            address,
+            "after its reset",
+            &*function.config(),
+            port.as_ref(),
+        );
+    }
+    (before.settle)(services, &resources[registers_at], &identified)?;
+    // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
+    unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
+    let capabilities = function
+        .capabilities()
+        .map_err(ServiceError::PciCapability)?;
+    let msi = capabilities
+        .iter()
+        .find(|(_, id)| *id == MSI_CAPABILITY)
+        .map(|(offset, _)| Msi::at(u16::from(*offset)));
+    #[cfg(feature = "nvk")]
+    let drm = {
+        let config = function.config();
+        let subsystem = config.read32(SUBSYSTEM_ID).map_err(ServiceError::Config)?;
+        let revision = config.read8(REVISION).map_err(ServiceError::Config)?;
+        client::DrmDevice {
+            segment: address.segment,
+            vendor: function.vendor,
+            device: function.device,
+            subsystem_vendor: subsystem as u16,
+            subsystem_device: (subsystem >> 16) as u16,
+            bus: address.bus,
+            slot: address.device,
+            function: address.function,
+            revision,
+            minor: 0,
+        }
+    };
+    #[cfg(feature = "nvk")]
+    let link = capabilities
+        .iter()
+        .find(|(_, id)| *id == PCIE_CAPABILITY)
+        .map(|(offset, _)| {
+            function
+                .config()
+                .read16(u16::from(*offset) + LINK_STATUS)
+                .map(PcieLink::from_link_status)
+        })
+        .transpose()
+        .map_err(ServiceError::Config)?;
+    Ok(Claimed {
+        shows_screen: owns_screen,
+        device: Device {
+            config: SharedConfig(Rc::new(RefCell::new(ManuallyDrop::into_inner(function)))),
+            msi,
+            custody: FunctionCustody::new(ManuallyDrop::into_inner(attachment)),
+            _views: views,
+            _resources: resources,
+        },
+        firmware: identified.firmware,
+        parameters: identified.parameters,
+        searched: identified.searched,
+        placement,
+        bars,
+        name: format!("{address}"),
+        stack,
+        #[cfg(feature = "nvk")]
+        integrated: stack.kernel.table_integrated(adapter),
+        #[cfg(feature = "nvk")]
+        drm,
+        #[cfg(feature = "nvk")]
+        link,
+        port,
+    })
+}
+
+/// The firmware's screen a claim retired before it sized the GPU's BARs. A
+/// claim that stops before the GPU's views are sealed for its reset changed
+/// nothing the GPU scans out, so the screen is given back: the boot's text
+/// and, when another GPU draws, the guest's copied frames show there again.
+struct RetiredScreen {
+    address: stela_drivers::bus::pci::Address,
+    retired: bool,
+}
+
+impl RetiredScreen {
+    /// The claim goes on to seal and reset the GPU, which ends its picture.
+    fn spend(mut self) {
+        self.retired = false;
+    }
+}
+
+impl Drop for RetiredScreen {
+    fn drop(&mut self) {
+        if self.retired && crate::console::restore_firmware() {
+            output::arguments(format_args!(
+                "GPU {}: the firmware's picture stays on its screen, as the claim stopped \
+                 before the GPU was reset\n",
+                self.address
+            ));
+        }
+    }
+}
+
+/// After a reset, which puts each Resizable BAR back at the size firmware
+/// set without checking it, as Linux `pci_restore_rebar_state` does: a BAR
+/// that kept a smaller size decodes only that, so the GPU's placement and
+/// windows take the size it reads back, with a line. One that reads back
+/// larger keeps the size its window was placed for, which it decodes too.
+fn resized_bars<C: ConfigSpace>(
+    address: stela_drivers::bus::pci::Address,
+    function: &Function<C>,
+    placement: &mut Placement,
+    bars: &mut [core::ops::Range<u64>],
+) {
+    let resizable = match function.resizable_bars() {
+        Ok(resizable) => resizable,
+        Err(error) => {
+            output::arguments(format_args!(
+                "GPU {address}: its Resizable BAR sizes did not read after its reset ({error:?}); \
+                 going on with the sizes firmware set\n"
+            ));
+            return;
+        }
+    };
+    for bar in resizable {
+        let Some(region) = placement.regions.get_mut(usize::from(bar.bar)) else {
+            continue;
+        };
+        if region.size == 0 || region.size == bar.bytes {
+            continue;
+        }
+        let mib = |bytes: u64| bytes >> 20;
+        if bar.bytes > region.size {
+            output::arguments(format_args!(
+                "GPU {address}: BAR{} reads back at {} MiB after its reset, where firmware set {} MiB; \
+                 keeping {} MiB, the window it was placed in\n",
+                bar.bar,
+                mib(bar.bytes),
+                mib(region.size),
+                mib(region.size)
+            ));
+            continue;
+        }
+        output::arguments(format_args!(
+            "GPU {address}: BAR{} came back at {} MiB after its reset, where firmware set {} MiB; \
+             going on with {} MiB, as Linux goes on from the reset\n",
+            bar.bar,
+            mib(bar.bytes),
+            mib(region.size),
+            mib(bar.bytes)
+        ));
+        if let Some(window) = bars.iter_mut().find(|window| window.start == region.start) {
+            window.end = window.start + bar.bytes;
+        }
+        region.size = bar.bytes;
+    }
+}
+
+/// Read one BAR0 register through a scoped read-only page of `registers`,
+/// or `None` when it cannot be mapped or read.
+fn cold_refusal(
+    address: stela_drivers::bus::pci::Address,
+    error: gpu::cold::Error,
+) -> ServiceError {
+    output::arguments(format_args!("GPU {address} cold preparation: {error:?}\n"));
+    ServiceError::Refused("the GPU's original cold handoff was refused")
+}
+
+/// An adapter with a driver stack that [`claim_all`] did not claim, for the boot screen
+/// (`stela_boot_core::gpu_status`).
+pub(super) struct Refused {
+    pub(super) vendor: gpu::Vendor,
+    pub(super) address: String,
+    pub(super) device: u16,
+    pub(super) reason: stela_boot_core::gpu_status::Reason,
+    /// The refusal's own words, for the screen as for the log.
+    pub(super) why: String,
+}
+
+/// Claim every adapter Stela has a driver stack for ([`GpuStack::select`]),
+/// each reported if it cannot be, and the ones refused. In a foreground
+/// continuation, with probe finished.
+pub(super) fn claim_all(
+    services: &dyn NativeServices,
+    adapters: &[gpu::Adapter],
+    isa_bridges: &[stela_drivers::probe::IsaBridge],
+    gop: Result<crate::pci_io::ScreenOwner, String>,
+    catalog: Option<&Arc<Catalog>>,
+    port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
+) -> (Vec<Claimed>, Vec<Refused>) {
+    use stela_boot_core::gpu_status::Reason;
+    let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
+        vendor: adapter.vendor,
+        address: format!("{}", adapter.address),
+        device: adapter.device,
+        reason,
+        why: format!("{why}"),
+    };
+    let mut driven = Vec::new();
+    for adapter in adapters {
+        match GpuStack::select(adapter) {
+            Ok(stack) => driven.push((stack, adapter)),
+            Err(reason) => output::arguments(format_args!(
+                "GPU {} vendor={:?} device={:04x} unused: {reason}\n",
+                adapter.address, adapter.vendor, adapter.device,
+            )),
+        }
+    }
+    // Drawing discrete GPUs come first, then drawing integrated ones, then
+    // display-only ones, each in the firmware's order, so the GPUs Metal
+    // prefers have the first DRM minors whatever else the PC holds.
+    driven.sort_by_key(|(stack, adapter)| stack.claim_order(adapter));
+    if !cfg!(feature = "nvk") {
+        let mut refused = Vec::new();
+        for (_, adapter) in driven {
+            let why = "this image has no GPU driver: build it with `cargo xtask boot build`";
+            output::arguments(format_args!(
+                "GPU {} left with firmware: {why}\n",
+                adapter.address
+            ));
+            refused.push(refused_as(adapter, Reason::Other, &why));
+        }
+        return (Vec::new(), refused);
+    }
+    let mut claimed = Vec::new();
+    let mut refused = Vec::new();
+    let source = match gop {
+        Ok(source) => source,
+        Err(why) => {
+            for (_, adapter) in driven {
+                output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
+                refused.push(refused_as(adapter, Reason::Other, &why));
+            }
+            return (claimed, refused);
+        }
+    };
+    // The claimed GPUs that draw, each with how it counts as integrated.
+    let mut drawing: Vec<(String, bool)> = Vec::new();
+    for (stack, adapter) in driven {
+        let integrated = stack.kernel.table_integrated(adapter);
+        if let Some(drawer) = shows_frames_only(&drawing, stack.draws(), integrated)
+            && !may_show_screen(source, adapter.address)
+        {
+            output::arguments(format_args!(
+                "GPU {} left with firmware: it would only show the frames GPU {drawer} draws, \
+                 and the firmware's picture is not on it, so no display needs it\n",
+                adapter.address
+            ));
+            continue;
+        }
+        let result = catalog
+            .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
+            .and_then(|catalog| {
+                claim(
+                    services,
+                    (stack, adapter),
+                    isa_bridges,
+                    claimed.len() as u32,
+                    source,
+                    catalog.clone(),
+                    port_above(adapter.address),
+                )
+            });
+        match result {
+            Ok(function) => {
+                if stack.draws() {
+                    drawing.push((
+                        function.name.clone(),
+                        stela_drivers::gpu::stack::drawing_kind(integrated),
+                    ));
+                }
+                claimed.push(function);
+            }
+            Err(error) => {
+                output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
+                let reason = match error {
+                    ServiceError::Refused(before::NO_FIRMWARE) => Reason::MissingFirmware,
+                    ServiceError::Refused(before::FIRMWARE_READ_FAILED) => {
+                        Reason::FirmwareReadFailed
+                    }
+                    ServiceError::Refused(before::FIRMWARE_NOT_READ) => Reason::FirmwareNotRead,
+                    _ => Reason::Other,
+                };
+                refused.push(refused_as(adapter, reason, &error));
+            }
+        }
+    }
+    (claimed, refused)
+}
+
+/// The claimed drawing GPU whose frames a GPU surely would only show
+/// ([`stela_drivers::gpu::stack::only_shows_frames_of`]). `drawing` holds
+/// each claimed drawing GPU's name and how it counts as integrated.
+fn shows_frames_only(
+    drawing: &[(String, bool)],
+    draws: bool,
+    integrated: Option<bool>,
+) -> Option<&str> {
+    let kinds: Vec<bool> = drawing.iter().map(|(_, integrated)| *integrated).collect();
+    stela_drivers::gpu::stack::only_shows_frames_of(&kinds, draws, integrated)
+        .map(|index| drawing[index].0.as_str())
+}
+
+/// Whether the firmware's picture may be on the function at `address`, as
+/// [`claim`] decides it, without its reads: Stela shows one display, which a
+/// drawing GPU's outputs take first, so a GPU that only shows another's
+/// frames is started only where the panel or monitor the firmware lit may
+/// hang on it.
+fn may_show_screen(
+    gop: crate::pci_io::ScreenOwner,
+    address: stela_drivers::bus::pci::Address,
+) -> bool {
+    use crate::pci_io::ScreenOwner;
+    match gop {
+        ScreenOwner::Function(source) => source.address == address,
+        ScreenOwner::Unknown(apart) => {
+            stela_boot_core::firmware_screen::gpu_may_show(&apart, address.segment, address.bus)
+        }
+        ScreenOwner::NoScreen => false,
+    }
+}
+
+/// A GPU its stack's kernel driver bound.
+#[cfg(feature = "nvk")]
+struct Bound {
+    name: String,
+    /// Whether it may be the GPU that showed the firmware's screen, when the
+    /// screen's function is unknown.
+    shows_screen: bool,
+    stack: &'static GpuStack,
+    /// As [`Claimed::integrated`].
+    integrated: Option<bool>,
+    drm: client::DrmDevice,
+    link: Option<PcieLink>,
+    /// The PCI Express port above it, read when it stops answering.
+    port: Option<link::Port>,
+}
+
+/// The original managed child runs the driver's initcalls and probe.
+struct Start {
+    kernel: &'static LinuxKernel,
+    claimed: ManuallyDrop<Vec<Claimed>>,
+    /// What the first start runs before any probe; a later one has none.
+    setup: Option<Setup>,
+    completed: Rc<Cell<Option<ManuallyDrop<Started>>>>,
+}
+
+/// What Linux needs of every claimed GPU before the first probe: the words
+/// of its command line each GPU's driver needs set before it registers, and
+/// the functions a probe searches for, each once.
+struct Setup {
+    command_line: String,
+    searched: Vec<stela_linux::function::Identity>,
+}
+
+impl Setup {
+    fn of(claimed: &[Claimed]) -> Self {
+        let command_line = claimed
+            .iter()
+            .filter_map(|claimed| claimed.parameters.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
+        for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
+            if !searched
+                .iter()
+                .any(|seen| (seen.bus, seen.devfn) == (identity.bus, identity.devfn))
+            {
+                searched.push(*identity);
+            }
+        }
+        Self {
+            command_line,
+            searched,
+        }
+    }
+}
+
+struct Started {
+    _attached: Vec<Attached<Device>>,
+    _searched: Vec<stela_linux::function::Published>,
+    /// The claimed GPUs no driver bound: each one's address, the driver,
+    /// and whether the firmware's picture was on it.
+    unbound: Vec<(String, &'static str, bool)>,
+    #[cfg(feature = "nvk")]
+    bound: Vec<Bound>,
+    result: Result<(), Errno>,
+}
+
+// SAFETY: the original managed runtime enters the canonical owner on the
+// child before run. The job retains the actual devices until it publishes
+// the result, whose attachments remain owned for the boot.
+unsafe impl ManagedJob for Start {
+    fn run(mut self: Pin<&mut Self>) {
+        let claimed = core::mem::take(&mut *self.claimed);
+        let setup = self.setup.take();
+        self.completed
+            .set(Some(ManuallyDrop::new(start(self.kernel, claimed, setup))));
+    }
+}
+
+fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> Started {
+    #[cfg(feature = "nvk")]
+    stela_boot_core::heap::set_peak_hook(gate::peak_passed);
+    let mut job = Started {
+        _attached: Vec::new(),
+        _searched: Vec::new(),
+        unbound: Vec::new(),
+        #[cfg(feature = "nvk")]
+        bound: Vec::new(),
+        result: Ok(()),
+    };
+    if let Some(setup) = setup {
+        if !setup.command_line.is_empty() {
+            output::arguments(format_args!(
+                "GPU: Linux starts with \"{}\"\n",
+                setup.command_line
+            ));
+        }
+        // SAFETY: entered, on a task.
+        job.result = unsafe { gpu::stack::start_kernel(&setup.command_line) };
+        if job.result.is_err() {
+            // No source-specific device return was acknowledged.
+            core::mem::forget(claimed);
+            return job;
+        }
+        // What the drivers search for, before any driver's probe: a probe
+        // looks for them (`intel_pch.c` for the chipset).
+        for identity in setup.searched {
+            // SAFETY: entered, on the canonical kernel task; the publication
+            // is kept for the boot.
+            match unsafe { stela_linux::function::Published::new(identity) } {
+                Ok(published) => job._searched.push(published),
+                Err(error) => output::arguments(format_args!(
+                    "GPU: PCI function {:02x}:{:02x}.{} could not be published for searches: \
+                     Linux error {error}\n",
+                    identity.bus,
+                    identity.devfn >> 3,
+                    identity.devfn & 7
+                )),
+            }
+        }
+    }
+    for claimed in claimed {
+        let authority = {
+            let mut function = claimed.device.config.0.borrow_mut();
+            // SAFETY: the firmware keys came from the real chipset read on the
+            // exact register BAR and were rechecked after its consumed reset.
+            // Device and catalogue share the original native attachment.
+            unsafe {
+                PciAuthority::new(
+                    kernel,
+                    claimed.device.custody.clone(),
+                    function.config(),
+                    claimed.firmware,
+                )
+            }
+        };
+        let authority = match authority {
+            Ok(authority) => authority,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "GPU {} catalogue refused: {error}\n",
+                    claimed.name
+                ));
+                core::mem::forget(claimed.device);
+                continue;
+            }
+        };
+        // SAFETY: entered on the same canonical kernel task. The device and
+        // enrolled catalogue retain the exact original configuration/attachment.
+        let attached = unsafe {
+            Attached::new_catalogued(kernel, claimed.device, claimed.placement, authority)
+        };
+        match attached {
+            Ok(attached) => {
+                // SAFETY: entered.
+                if unsafe { attached.bound() } {
+                    output::arguments(format_args!(
+                        "GPU {}: {} bound it\n",
+                        claimed.name, claimed.stack.kernel.driver
+                    ));
+                    #[cfg(feature = "nvk")]
+                    job.bound.push(Bound {
+                        name: claimed.name,
+                        shows_screen: claimed.shows_screen,
+                        stack: claimed.stack,
+                        integrated: claimed.integrated,
+                        drm: claimed.drm,
+                        link: claimed.link,
+                        port: claimed.port,
+                    });
+                } else {
+                    // The claim reset the function, so the firmware's
+                    // picture on its outputs is gone and nothing draws there.
+                    output::arguments(format_args!(
+                        "GPU {}: {} did not bind it; Linux's lines above say why.{}\n",
+                        claimed.name,
+                        claimed.stack.kernel.driver,
+                        if claimed.shows_screen {
+                            " The firmware's picture was on this GPU and ended when it was \
+                             reset for the claim, so a display wired to it stays dark"
+                        } else {
+                            ""
+                        }
+                    ));
+                    job.unbound.push((
+                        claimed.name,
+                        claimed.stack.kernel.driver,
+                        claimed.shows_screen,
+                    ));
+                }
+                job._attached.push(attached);
+            }
+            Err(error) => output::arguments(format_args!(
+                "GPU {} presentation refused: {:?}\n",
+                claimed.name, error.error
+            )),
+        }
+    }
+    job
+}
+
+/// The running environment.
+#[cfg_attr(
+    not(feature = "nvk"),
+    allow(
+        dead_code,
+        reason = "held for the boot; only Mesa's client reads these"
+    )
+)]
+struct Installed {
+    work: &'static KernelWork,
+    time: Arc<dyn Clock>,
+    events: Arc<Events>,
+    domain: Arc<Domain<SLOTS>>,
+    /// When the service is next due, as a TSC value: the clock reads only
+    /// in the Linux environment's root, and the boot loop asks outside it.
+    next: AtomicU64,
+    #[cfg(feature = "nvk")]
+    window: &'static Window,
+    tsc_hz: u64,
+    #[cfg(feature = "nvk")]
+    libc_clock: client::LibcClock,
+    #[cfg(feature = "nvk")]
+    heap_bytes: u64,
+    /// Clients' mappings, by address. For tasks.
+    #[cfg(feature = "nvk")]
+    mappings: RefCell<BTreeMap<u64, client::ClientMap>>,
+    /// Mesa's running threads, by the bottom of their stacks. Only Linux
+    /// entries, under the host drivers' lock, read and change it.
+    #[cfg(feature = "nvk")]
+    mesa_threads: RefCell<BTreeMap<u64, client::Running>>,
+    #[cfg(feature = "nvk")]
+    service: client::Service,
+    owner: &'static Arc<LinuxKernel>,
+    threads: &'static LinuxThreads,
+    start: ManuallyDrop<Started>,
+}
+
+impl Installed {
+    fn advance_children(&self) {
+        // SAFETY: callers are on the same dispatcher after physical return,
+        // outside native/source stacks and metadata loans.
+        if let Err(error) = unsafe { self.threads.dispatcher_step() } {
+            output::fatal(format_args!(
+                "Linux original task retirement failed: {error}"
+            ));
+        }
+    }
+}
+
+static INSTALLED: AtomicPtr<Installed> = AtomicPtr::new(ptr::null_mut());
+
+fn installed() -> Option<&'static Installed> {
+    // SAFETY: a published environment is leaked, so it lives for the boot.
+    unsafe { INSTALLED.load(Ordering::Acquire).as_ref() }
+}
+
+/// What [`open`] needs beyond the claimed functions.
+pub(super) struct Machine {
+    pub work: &'static KernelWork,
+    pub window: &'static Window,
+    pub random: Seeded,
+    pub tsc_hz: u64,
+    pub wall: Option<RtcReading>,
+    /// The host heap capacity reported to the linked graphics runtime.
+    #[cfg(feature = "nvk")]
+    pub heap_bytes: u64,
+}
+
+fn environment_error(error: WorkError) -> kernel_work::Error {
+    kernel_work::Error::Work(error)
+}
+
+/// The GPUs that started and whether each draws, and whether macOS has a
+/// Metal device on them, for the boot's identity line (`ident`).
+pub(super) fn ident() -> String {
+    #[cfg(feature = "nvk")]
+    {
+        let bound = installed().map_or(&[][..], |gpu| gpu.start.bound.as_slice());
+        if bound.is_empty() {
+            return String::from("none started");
+        }
+        let mut text = String::new();
+        for gpu in bound {
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            text.push_str(&gpu.name);
+            text.push_str(match gpu.stack.draws() {
+                true => " draws",
+                false => " shows only",
+            });
+        }
+        text.push_str(match gate::shared().is_empty() {
+            true => "; no Metal device open",
+            false => "; Metal device open",
+        });
+        text
+    }
+    #[cfg(not(feature = "nvk"))]
+    String::from("no GPU driver in this build")
+}
+
+/// Why this boot gives macOS no Metal device, if it does not. WindowServer
+/// aborts without one and watchdogd
+/// then panics the system, so a boot of macOS stops here instead.
+pub(super) fn no_metal_device() -> Option<&'static str> {
+    #[cfg(feature = "nvk")]
+    return gate::shared().is_empty().then(|| {
+        let bound = installed().map_or(&[][..], |gpu| gpu.start.bound.as_slice());
+        match (bound.is_empty(), bound.iter().any(|gpu| gpu.stack.draws())) {
+            (true, _) => "no GPU started; the lines above say why",
+            // Its stack has a kernel driver alone in this image.
+            (false, false) => {
+                "the GPU that started only shows a picture: this image has no Vulkan driver \
+                 for it, and macOS needs a GPU that draws"
+            }
+            (false, true) => {
+                "no Metal device opened on the GPUs that started; the lines above say why"
+            }
+        }
+    });
+    #[cfg(not(feature = "nvk"))]
+    Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
+}
+
+/// The kexts a boot that gives the GPUs to nouveau links into its system.
+pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
+    #[cfg(any(feature = "nvk", feature = "soft-gpu"))]
+    return alloc::vec![stela_loader::aux_kc::Kext {
+        info: kext::INFO,
+        objects: kext::OBJECTS.to_vec(),
+        bundle_path: "/Library/Extensions/StelaGPU.kext".into(),
+        trusted_code: kext::TRUSTED_CODE.to_vec(),
+    }];
+    #[cfg(not(any(feature = "nvk", feature = "soft-gpu")))]
+    Vec::new()
+}
+
+/// Takes the display for the GPUs [`open`] bound, in the monitor's own mode
+/// or else the firmware's `screen` size, and opens their Metal services. `firmware` names the PCI
+/// function that showed the firmware's picture, `None` when there was a
+/// picture whose function is unknown.
+pub(super) fn serve(
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: Option<(usize, usize)>,
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] firmware: Option<&str>,
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] size: Option<(u32, u32)>,
+) {
+    #[cfg(feature = "nvk")]
+    {
+        let shown = match (screen, firmware) {
+            (None, _) => display::Shown::Nothing,
+            (Some(_), None) => display::Shown::Unknown,
+            (Some(_), Some(function)) => display::Shown::By(function),
+        };
+        display::take(screen.unwrap_or((0, 0)), shown, size);
+        gate::open_service();
+    }
+}
+
+/// When a GPU's display shows on a laptop's built-in panel, set the panel's
+/// brightness through ACPI video, as Linux's ACPI video driver does when it
+/// registers the panel's backlight, which nouveau asks of it where it has
+/// none of its own: the level read back where it is listed and not zero,
+/// else the highest (`stela_drivers::probe::backlight`). The GPU's reset
+/// may have left the backlight at zero, a picture with no light. One line
+/// for each output device, or one saying none was found.
+pub(super) fn panel_brightness(
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] acpi: Option<
+        &'static super::aml::HostAcpi,
+    >,
+) {
+    #[cfg(feature = "nvk")]
+    {
+        use stela_drivers::probe::backlight::{self, Brightness};
+        if !display::panel_shown() {
+            return;
+        }
+        let Some(acpi) = acpi else {
+            output::arguments(format_args!(
+                "DISPLAY built-in panel: no ACPI namespace, so its brightness stays as it is\n"
+            ));
+            return;
+        };
+        let Some(found) = acpi.firmware(
+            "panel brightness",
+            "the panel keeps the brightness it has",
+            false,
+            backlight::initialize_all,
+        ) else {
+            return;
+        };
+        let outcomes = match found {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "DISPLAY built-in panel: ACPI devices unreadable (status {:#x}), so its \
+                     brightness stays as it is\n",
+                    error.0
+                ));
+                return;
+            }
+        };
+        if outcomes.is_empty() {
+            output::arguments(format_args!(
+                "DISPLAY built-in panel: ACPI has no display output with _BCL and _BCM, so \
+                 only the GPU driver sets its brightness\n"
+            ));
+        }
+        for outcome in outcomes {
+            let path = outcome.path;
+            match outcome.result {
+                Ok(Brightness { level, max, read }) => {
+                    let read = match read {
+                        Some(read) => format!("read {read}"),
+                        None => String::from("not readable"),
+                    };
+                    output::arguments(format_args!(
+                        "DISPLAY panel brightness {path}: set to {level} of {max} ({read})\n"
+                    ));
+                }
+                Err(None) => output::arguments(format_args!(
+                    "DISPLAY panel brightness {path}: _BCL lists no levels, left as it is\n"
+                )),
+                Err(Some(error)) => output::arguments(format_args!(
+                    "DISPLAY panel brightness {path}: _BCM refused (status {:#x})\n",
+                    error.0
+                )),
+            }
+        }
+    }
+}
+
+/// Bring Linux up over `claimed`, and return once nouveau has bound them or
+/// failed, as the guest should not start with a half-started GPU beneath it.
+pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
+    // Keep the exact original claims on every partial startup refusal.
+    let claimed = ManuallyDrop::new(claimed);
+    let Machine {
+        work,
+        window,
+        random,
+        tsc_hz,
+        wall,
+        #[cfg(feature = "nvk")]
+        heap_bytes,
+    } = machine;
+    let image = work.image()?;
+    let task_data = work.task_data()?;
+    #[cfg(feature = "nvk")]
+    let claiming = !claimed.is_empty();
+    let lines = claimed
+        .iter()
+        .map(|claimed| Line {
+            config: claimed.device.config.clone(),
+            msi: claimed.device.msi,
+            custody: claimed.device.custody.clone(),
+            registration: None,
+            retired: None,
+        })
+        .collect();
+    let bars = claimed
+        .iter()
+        .flat_map(|claimed| claimed.bars.iter().cloned())
+        .collect();
+    let clock = work.service_clock().map_err(environment_error)?;
+    let epoch = clock.epoch().map_err(environment_error)?;
+    #[cfg(feature = "nvk")]
+    let libc_clock = client::LibcClock::anchor(|| epoch.now_ns()).map_err(environment_error)?;
+    let time = clock.clock();
+    let events = Arc::new(Events {
+        clock: clock.clone(),
+        idle: clock.idle(),
+        pending: AtomicBool::new(false),
+    });
+    // Linux's service runs for raised work and its earliest timer only:
+    // nothing here consumes a periodic tick, and one would pump the boot
+    // CPU every millisecond while the GPU idles.
+    let domain = Domain::tickless(time.clone(), events.clone()).map_err(environment_error)?;
+    let realtime = wall.and_then(|reading| {
+        if tsc_hz == 0
+            || !crate::cpu::INVARIANT_TSC.present()
+            || reading.resolution == 0
+            || reading.tsc_before > reading.tsc_after
+        {
+            return None;
+        }
+        // Move the firmware wall sample to a fresh observation in the
+        // installed monotonic epoch, using the boot CPU's invariant TSC
+        // only to carry UTC forward from the firmware read.
+        let monotonic_ns = i64::try_from(epoch.now_ns().ok()?).ok()?;
+        let elapsed = host::rdtsc().checked_sub(reading.tsc_after)?;
+        let wall_ns = u128::from(elapsed) * 1_000_000_000 / u128::from(tsc_hz)
+            + u128::from(reading.utc.nanosecond);
+        let seconds = reading
+            .utc
+            .seconds
+            .checked_add(u64::try_from(wall_ns / 1_000_000_000).ok()?)?;
+        RealtimeOrigin::new(
+            monotonic_ns,
+            i64::try_from(seconds).ok()?,
+            (wall_ns % 1_000_000_000) as u32,
+        )
+    });
+    let platform = Host {
+        work,
+        task_data,
+        tsc_hz,
+        clock: epoch,
+        realtime,
+        window,
+        image: image.clone(),
+        random: RefCell::new(random),
+        environment: Cell::new(ptr::null()),
+        bars,
+        devices: RefCell::new(BTreeMap::new()),
+        lines: RefCell::new(lines),
+        reported: RefCell::new(BTreeSet::new()),
+        first_error: RefCell::new(None),
+        gsp_start: RefCell::new(Default::default()),
+    };
+    // SAFETY: boot's original code and allocator remain installed permanently.
+    unsafe {
+        stela_linux::image::register(image).map_err(|_| kernel_work::Error::Inventory)?;
+        stela_linux::heap::register(allocate_zeroed).map_err(|_| kernel_work::Error::Inventory)?;
+    }
+    #[cfg(feature = "nvk")]
+    BOOT_CPU.store(host::processor(), Ordering::Relaxed);
+    let (owner, threads, job) = work.dispatch_linux(|runtime| {
+        Ok(mount_and_start(
+            work,
+            runtime,
+            platform,
+            domain.clone(),
+            claimed,
+            time.as_ref(),
+        ))
+    })??;
+    // On the boot screen too, for the case that another adapter shows it.
+    for (name, driver, dark) in &job.unbound {
+        crate::status::warning(&stela_boot_core::gpu_status::unbound(name, driver, *dark));
+    }
+    let result = job.result.map_err(Error::Init);
+    #[cfg(feature = "nvk")]
+    let result = result.and_then(|()| {
+        if claiming && job.bound.is_empty() {
+            Err(Error::NoDevices)
+        } else {
+            Ok(())
+        }
+    });
+    let installed = Box::new(Installed {
+        work,
+        time,
+        events,
+        domain,
+        // Due at once: the first pump finds Linux's own deadline.
+        next: AtomicU64::new(0),
+        #[cfg(feature = "nvk")]
+        window,
+        tsc_hz,
+        #[cfg(feature = "nvk")]
+        libc_clock,
+        #[cfg(feature = "nvk")]
+        heap_bytes,
+        #[cfg(feature = "nvk")]
+        mappings: RefCell::new(BTreeMap::new()),
+        #[cfg(feature = "nvk")]
+        mesa_threads: RefCell::new(BTreeMap::new()),
+        #[cfg(feature = "nvk")]
+        service: client::Service::default(),
+        owner,
+        threads,
+        start: job,
+    });
+    INSTALLED.store(Box::into_raw(installed), Ordering::Release);
+    result
+}
+
+/// TSC ticks [`open`] took to start Linux and for nouveau's probe.
+static START_TICKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The ticks the last [`open`] took starting Linux and probing the GPUs.
+pub(super) fn start_times() -> (u64, u64) {
+    (
+        START_TICKS[0].load(Ordering::Relaxed),
+        START_TICKS[1].load(Ordering::Relaxed),
+    )
+}
+
+type MountedStartup = (
+    &'static Arc<LinuxKernel>,
+    &'static LinuxThreads,
+    ManuallyDrop<Started>,
+);
+
+fn mount_and_start(
+    work: &'static KernelWork,
+    runtime: Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>,
+    platform: Host,
+    domain: Arc<Domain<SLOTS>>,
+    claimed: ManuallyDrop<Vec<Claimed>>,
+    time: &dyn Clock,
+) -> Result<MountedStartup, Error> {
+    let deadline = time
+        .now_ns()
+        .and_then(|now| {
+            now.checked_add(START_SECONDS * 1_000_000_000)
+                .ok_or(WorkError::Exhausted)
+        })
+        .map_err(environment_error)?;
+    let started = host::rdtsc();
+    // SAFETY: the enclosing dispatch owns this exact root/CPU/clock and
+    // queue. The original heap, executable backing, platform and catalogue
+    // stay retained permanently, including any partial kernel publication.
+    let kernel =
+        unsafe { KernelOwner::new(platform, runtime, domain.clone(), work.linux_geometry()) }
+            .map_err(|failure| Error::Kernel(failure.error))?;
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the canonical broker retains this CPU-local kernel through Arc"
+    )]
+    let owner = &*Box::leak(Box::new(Arc::new(kernel)));
+    owner
+        .platform()
+        .environment
+        .set(addr_of!(*owner.environment()));
+    // SAFETY: this same native dispatcher owns the already claimed kernel
+    // and no task has been published. The catalogue must retain this owner.
+    let pages = unsafe { work.register_linux_pages(owner.as_ref()) }?;
+    // SAFETY: the permanent, same-owner runtime, catalogue and service
+    // domain were installed above. No original child has started yet.
+    let threads = unsafe { TaskRuntime::install(owner.clone(), runtime, pages, SLOTS) }
+        .map_err(Error::Threads)?;
+    let threads = &*Box::leak(Box::new(threads));
+    // Reserve the error envelope before Initial can publish native state.
+    let initial_failure = Box::new_uninit();
+    // SAFETY: this exact source, root and broker remain kept on refusal. Each
+    // runtime step runs inside the same live native execution segment.
+    unsafe { Pin::new(owner.as_ref()).start_initial(work.linux_root(), threads) }
+        .map_err(|error| Error::Initial(Box::write(initial_failure, error)))?;
+
+    // SAFETY: submit via this actual original task broker. The service
+    // initializes the original resources before dispatching accepted jobs.
+    let srcu = unsafe { stela_linux::srcu::Bootstrap::start(owner.clone(), threads) }
+        .map_err(|failure| Error::SrcuStart(failure.error))?;
+    wait_for_child(
+        runtime,
+        threads,
+        time,
+        deadline,
+        &FIRST_TASKS,
+        true,
+        || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
+    )?;
+    // SAFETY: the taskless dispatcher observed the original joined job.
+    // Only this consuming join can acknowledge public SRCU admission.
+    let ready = unsafe { srcu.join() }.map_err(|failure| Error::Srcu(failure.error))?;
+    let probing = host::rdtsc();
+    START_TICKS[0].store(probing.wrapping_sub(started), Ordering::Relaxed);
+    let setup = Setup::of(&claimed);
+    let (claimed, later) = by_probe_turn(claimed);
+    let completed = Rc::new(Cell::new(None));
+    let job = Box::pin(Start {
+        kernel: owner.as_ref(),
+        claimed,
+        setup: Some(setup),
+        completed: completed.clone(),
+    });
+    // SAFETY: the ready original task broker keeps the callback and all
+    // original owners until its genuine managed child has joined.
+    let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
+    // The second turn follows only when GPUs wait for it.
+    wait_for_child(
+        runtime,
+        threads,
+        time,
+        deadline,
+        &PROBE,
+        !later.is_empty(),
+        || pending.status().joined,
+    )?;
+    // SAFETY: physical return on the same dispatcher with the joined status.
+    let joined =
+        unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
+    if joined.outcome() != Outcome::CallbackReturned {
+        return Err(Error::Child(joined.outcome()));
+    }
+    let mut job = completed
+        .take()
+        .ok_or_else(|| environment_error(WorkError::corrupt()))?;
+    drop(joined.into_job());
+    if !later.is_empty() {
+        probe_later(owner.as_ref(), runtime, threads, time, later, &mut job)?;
+    }
+    START_TICKS[1].store(host::rdtsc().wrapping_sub(probing), Ordering::Relaxed);
+    drop(ready);
+    Ok((owner, threads, job))
+}
+
+/// The claimed GPUs in the two turns of their probes: first those that may
+/// serve the Metal device, then those that may only show the frames another
+/// draws ([`stela_drivers::gpu::stack::may_only_show_frames_of`]), each in
+/// the claims' order: a GPU whose kind only its probe tells waits for a
+/// known discrete one. A probe of the second turn that hangs or fails then
+/// costs its own GPU, not the one macOS draws on.
+fn by_probe_turn(
+    claimed: ManuallyDrop<Vec<Claimed>>,
+) -> (ManuallyDrop<Vec<Claimed>>, ManuallyDrop<Vec<Claimed>>) {
+    #[cfg(feature = "nvk")]
+    {
+        let mut drawing = Vec::new();
+        let (first, later): (Vec<_>, Vec<_>) = ManuallyDrop::into_inner(claimed)
+            .into_iter()
+            .partition(|claimed| {
+                let draws = claimed.stack.draws();
+                let first = stela_drivers::gpu::stack::may_only_show_frames_of(
+                    &drawing,
+                    draws,
+                    claimed.integrated,
+                )
+                .is_none();
+                if first && draws {
+                    drawing.push(stela_drivers::gpu::stack::drawing_kind(claimed.integrated));
+                }
+                first
+            });
+        (ManuallyDrop::new(first), ManuallyDrop::new(later))
+    }
+    #[cfg(not(feature = "nvk"))]
+    (claimed, ManuallyDrop::new(Vec::new()))
+}
+
+/// Probes `later`, the GPUs that would only show another's frames, after the
+/// first turn bound the others, within a deadline of its own. One that does
+/// not finish in time is reported with its GPUs as unbound, and its task and
+/// devices stay held; the GPUs of the first turn go on.
+fn probe_later(
+    kernel: &'static LinuxKernel,
+    runtime: Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>,
+    threads: &LinuxThreads,
+    time: &dyn Clock,
+    later: ManuallyDrop<Vec<Claimed>>,
+    job: &mut Started,
+) -> Result<(), Error> {
+    if job.result.is_err() {
+        // Linux did not start; nothing can bind them.
+        return Ok(());
+    }
+    let mut names: Vec<(String, &'static str, bool)> = later
+        .iter()
+        .map(|claimed| {
+            (
+                claimed.name.clone(),
+                claimed.stack.kernel.driver,
+                claimed.shows_screen,
+            )
+        })
+        .collect();
+    let deadline = time
+        .now_ns()
+        .and_then(|now| {
+            now.checked_add(START_SECONDS * 1_000_000_000)
+                .ok_or(WorkError::Exhausted)
+        })
+        .map_err(environment_error)?;
+    let completed = Rc::new(Cell::new(None));
+    let later_job = Box::pin(Start {
+        kernel,
+        claimed: later,
+        setup: None,
+        completed: completed.clone(),
+    });
+    // SAFETY: as for the first turn's job; Linux and its drivers started.
+    let pending =
+        unsafe { threads.submit(later_job) }.map_err(|refusal| Error::Submit(refusal.error))?;
+    // Their GPUs are reported unbound with why, and the first turn's go on.
+    let mut lost = |job: &mut Started, why: &dyn core::fmt::Display| {
+        for (name, driver, dark) in names.drain(..) {
+            output::arguments(format_args!(
+                "GPU {name}: {driver}'s probe {why}; the GPUs that started go on without it\n"
+            ));
+            job.unbound.push((name, driver, dark));
+        }
+    };
+    match wait_for_child(
+        runtime,
+        threads,
+        time,
+        deadline,
+        &PROBE_LATER,
+        false,
+        || pending.status().joined,
+    ) {
+        Ok(()) => {}
+        Err(Error::Timeout) => {
+            lost(
+                job,
+                &format_args!("did not finish in {START_SECONDS} s, and its task stays held"),
+            );
+            // The child still runs and owns these devices; its handle
+            // holds nothing of them and goes out of scope here.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+    // SAFETY: physical return on the same dispatcher with the joined status.
+    let joined =
+        unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
+    if joined.outcome() != Outcome::CallbackReturned {
+        lost(job, &format_args!("ended: {:?}", joined.outcome()));
+        core::mem::forget(joined);
+        return Ok(());
+    }
+    let mut later = completed
+        .take()
+        .ok_or_else(|| environment_error(WorkError::corrupt()))?;
+    drop(joined.into_job());
+    job._attached.append(&mut later._attached);
+    job.unbound.append(&mut later.unbound);
+    #[cfg(feature = "nvk")]
+    job.bound.append(&mut later.bound);
+    Ok(())
+}
+
+/// The start's stages [`wait_for_child`] names.
+static FIRST_TASKS: &str = "Linux's first tasks";
+static PROBE: &str = "the GPU's probe";
+static PROBE_LATER: &str = "the probe of GPUs that only show frames";
+
+/// Wait for `stage` of the start, which Linux's tasks run, until `finished`
+/// or `deadline` on `time`. A long wait says every
+/// [`WAIT_REPORT_SECONDS`] how long it has waited by the counter and by
+/// Linux's clock, and how many service steps it took, and stores the USB's
+/// log: a start that never returns then shows whether this loop still
+/// runs, whether Linux's clock moves, and which stage it waits for. The
+/// counter ends the wait after [`START_SECONDS`] even when the clock
+/// stands still, and stores the log before the start is given up. A stage
+/// another follows (`then`) stores the log when it finishes, so a next stage
+/// that stops the machine within its first report leaves this one's lines on
+/// the stick; the last stage's are stored by `open_gpus` once the start
+/// returns, outside it.
+fn wait_for_child(
+    runtime: Pin<&stela_drivers::platform::work::Runtime<SLOTS>>,
+    threads: &LinuxThreads,
+    time: &dyn Clock,
+    deadline: u64,
+    stage: &'static &'static str,
+    then: bool,
+    finished: impl Fn() -> bool,
+) -> Result<(), Error> {
+    struct Staged;
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            super::step_watchdog::clear_stage();
+        }
+    }
+    super::step_watchdog::stage(stage);
+    let _staged = Staged;
+    let began = host::rdtsc();
+    let began_ns = time.now_ns().map_err(environment_error)?;
+    let mut steps = 0u64;
+    let mut reports = 0u64;
+    loop {
+        // SAFETY: runtime is on its dispatcher after real physical return.
+        unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
+        if finished() {
+            if then {
+                super::storage::store_usb_log_in_gpu_start();
+            }
+            return Ok(());
+        }
+        let now = time.now_ns().map_err(environment_error)?;
+        let waited_ms = output::millis_since(began);
+        // The counter bounds the wait too, when Linux's clock stands still.
+        if now >= deadline || waited_ms >= START_SECONDS * 1000 {
+            super::storage::store_usb_log_in_gpu_start();
+            return Err(Error::Timeout);
+        }
+        if waited_ms / 1000 / WAIT_REPORT_SECONDS > reports {
+            reports = waited_ms / 1000 / WAIT_REPORT_SECONDS;
+            output::arguments(format_args!(
+                "GPU START waiting for {stage}: {waited_ms} ms by the counter, {} ms by \
+                 Linux's clock, {steps} steps\n",
+                now.saturating_sub(began_ns) / 1_000_000,
+            ));
+            super::storage::store_usb_log_in_gpu_start();
+        }
+        runtime.step_or_idle().map_err(environment_error)?;
+        steps += 1;
+    }
+}
+
+/// Startup failures distinguish the work environment from driver admission.
+#[derive(Debug)]
+pub(super) enum Error {
+    Environment(kernel_work::Error),
+    Kernel(stela_linux::kernel::Error),
+    Threads(stela_linux::task::runtime::RuntimeError),
+    Initial(Box<stela_linux::kernel::InitialStartError>),
+    SrcuStart(stela_linux::srcu::StartError),
+    Srcu(stela_linux::srcu::Error),
+    Submit(stela_linux::task::runtime::SubmitError),
+    Child(Outcome),
+    Init(Errno),
+    Timeout,
+    #[cfg(feature = "nvk")]
+    NoDevices,
+}
+
+impl From<kernel_work::Error> for Error {
+    fn from(error: kernel_work::Error) -> Self {
+        Self::Environment(error)
+    }
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Environment(error) => write!(f, "Linux environment: {error}"),
+            Self::Kernel(error) => write!(f, "{error}"),
+            Self::Threads(error) => write!(f, "{error}"),
+            Self::Initial(error) => write!(f, "{error}"),
+            Self::SrcuStart(error) => write!(f, "{error}"),
+            Self::Srcu(error) => write!(f, "{error}"),
+            Self::Submit(error) => write!(f, "GPU startup job refused: {error:?}"),
+            Self::Child(outcome) => write!(f, "GPU startup child ended: {outcome:?}"),
+            Self::Init(error) => write!(f, "Linux initialization failed: errno {}", -error),
+            Self::Timeout => {
+                f.write_str("GPU startup exceeded its deadline; native owners remain held")
+            }
+            #[cfg(feature = "nvk")]
+            Self::NoDevices => f.write_str("no Linux driver bound a claimed GPU"),
+        }
+    }
+}
+
+impl Installed {
+    /// The TSC ticks in `ns` nanoseconds.
+    fn tsc_after(&self, ns: u64) -> u64 {
+        let ticks = u128::from(ns) * u128::from(self.tsc_hz) / 1_000_000_000;
+        ticks.min(u128::from(u64::MAX)) as u64
+    }
+}
+
+/// When the environment's pending events were raised, as a TSC value: the
+/// age the boot PE's run loop bounds ([`pump_due`]).
+static PENDING_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// How long the environment's work may wait while the boot PE runs guest
+/// code at EL1 or EL2 with interrupts unmasked: it may hold a lock that
+/// disables only preemption, which other PEs spin on while it pumps.
+const DEFER_UNMASKED_NS: u64 = 1_000_000;
+/// The longest the work waits whatever the boot PE runs, interrupts masked
+/// included, where XNU holds its spinlocks: GPU completions and the calls
+/// other PEs posted are never later than this.
+const DEFER_LONGEST_NS: u64 = 4_000_000;
+/// How often a slice of a boot PE that holds work back ends to look again.
+const RECHECK_NS: u64 = 250_000;
+
+/// Why pumps ran, and what they took, since the last [`pump_report`].
+struct PumpCounts {
+    /// Pumps that ran the environment, by the boot PE's [`Calm`].
+    quiet: AtomicU64,
+    unmasked: AtomicU64,
+    forced: AtomicU64,
+    /// Pumps from a wait for the service's turn ([`gate::relax`]).
+    relaxed: AtomicU64,
+    /// Pumps for a posted call from the host service ([`pump_posted`]).
+    posted: AtomicU64,
+    /// Pumps by who ran them ([`Taker`]): the boot PE, a PE whose guest
+    /// waits, and Linux runs of a PE waiting for its own posted call.
+    by_taker: [AtomicU64; 3],
+    /// Ticks from work being ready until a pump took it, by taker, and the
+    /// longest, for the boot PE and a waiting PE.
+    taker_delay: [AtomicU64; 2],
+    taker_delay_longest: [AtomicU64; 2],
+    /// Sleeping PEs woken for ready work, and pumps a processor did not run
+    /// because another held the turn or the host drivers' lock.
+    woken: AtomicU64,
+    turn_busy: AtomicU64,
+    /// Calls for raised work not made, as a processor held the turn.
+    wakes_held: AtomicU64,
+    /// Pumps for raised events, and for Linux's deadline alone.
+    by_event: AtomicU64,
+    by_deadline: AtomicU64,
+    /// Pumps whose first step found nothing to run.
+    idle: AtomicU64,
+    /// Slice ends that held ready work back for a calmer boot PE.
+    deferred: AtomicU64,
+    /// Ticks pumping, and the longest pump.
+    ticks: AtomicU64,
+    longest: AtomicU64,
+    /// Ticks from work being ready until a pump took it, and the longest.
+    delay: AtomicU64,
+    delay_longest: AtomicU64,
+    /// The longest single step, which no budget ends: one Linux task run
+    /// until it sleeps. With the host's mapping shootdowns during it and the
+    /// posted calls (request code plus one) workers were performing as it
+    /// began.
+    step_longest: AtomicU64,
+    step_shootdowns: AtomicU64,
+    step_serving: [AtomicU32; 4],
+    /// Linux steps the pumps ran.
+    steps: AtomicU64,
+    /// Ticks the pumps spent by part ([`PumpPart`]), and the longest one
+    /// part took in a pump: what a long pump spent its time in.
+    parts: [AtomicU64; PumpPart::COUNT],
+    part_longest: [AtomicU64; PumpPart::COUNT],
+}
+
+/// The parts of a pump, timed for [`pump_report`].
+#[derive(Clone, Copy)]
+enum PumpPart {
+    /// Entering the environment: the host drivers' lock, the root switch
+    /// and the identity checks, until the first step.
+    Enter,
+    /// Retiring tasks and taking posted calls ([`client::start`]).
+    Children,
+    /// Linux's steps.
+    Steps,
+    /// Linux's next deadline, and leaving the environment.
+    Leave,
+    /// Looking for completed work ([`look_due`]).
+    Look,
+}
+
+impl PumpPart {
+    const COUNT: usize = 5;
+    const NAMES: [&str; Self::COUNT] = ["enter", "children", "steps", "leave", "look"];
+
+    fn add(self, ticks: u64) {
+        PUMPS.parts[self as usize].fetch_add(ticks, Ordering::Relaxed);
+        PUMPS.part_longest[self as usize].fetch_max(ticks, Ordering::Relaxed);
+    }
+}
+
+/// Host page-window unmappings by their source since [`pump_report`]: Linux
+/// device memory (`iounmap`), Linux pages (`vfree`, `vunmap`), the C
+/// library's file mappings (`munmap`, fixed remaps) and task stacks. Each
+/// costs one shootdown of every other processor.
+static UNMAPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The [`UNMAPS`] sources.
+#[derive(Clone, Copy)]
+pub(super) enum Unmapped {
+    Device,
+    Pages,
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    Files,
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    Stacks,
+}
+
+/// Counts one page-window unmapping from `source`.
+pub(super) fn unmapped(source: Unmapped) {
+    UNMAPS[source as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+static PUMPS: PumpCounts = PumpCounts {
+    quiet: AtomicU64::new(0),
+    unmasked: AtomicU64::new(0),
+    forced: AtomicU64::new(0),
+    relaxed: AtomicU64::new(0),
+    posted: AtomicU64::new(0),
+    by_taker: [const { AtomicU64::new(0) }; 3],
+    taker_delay: [const { AtomicU64::new(0) }; 2],
+    taker_delay_longest: [const { AtomicU64::new(0) }; 2],
+    woken: AtomicU64::new(0),
+    turn_busy: AtomicU64::new(0),
+    wakes_held: AtomicU64::new(0),
+    by_event: AtomicU64::new(0),
+    by_deadline: AtomicU64::new(0),
+    idle: AtomicU64::new(0),
+    deferred: AtomicU64::new(0),
+    ticks: AtomicU64::new(0),
+    longest: AtomicU64::new(0),
+    delay: AtomicU64::new(0),
+    delay_longest: AtomicU64::new(0),
+    step_longest: AtomicU64::new(0),
+    step_shootdowns: AtomicU64::new(0),
+    step_serving: [const { AtomicU32::new(0) }; 4],
+    steps: AtomicU64::new(0),
+    parts: [const { AtomicU64::new(0) }; PumpPart::COUNT],
+    part_longest: [const { AtomicU64::new(0) }; PumpPart::COUNT],
+};
+
+/// Ticks the boot CPU spent in posted pumps ([`pump_posted`]).
+#[cfg(feature = "nvk")]
+static POSTED_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// The ticks this processor spent in posted pumps so far: the boot CPU's
+/// total, and nothing on another processor, which runs none.
+pub(super) fn posted_ticks_here() -> u64 {
+    #[cfg(feature = "nvk")]
+    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
+        return POSTED_TICKS.load(Ordering::Relaxed);
+    }
+    0
+}
+
+/// The shootdowns counted so far, for a difference across a step.
+fn shootdowns() -> u64 {
+    #[cfg(feature = "nvk")]
+    return crate::native_mmio::shootdown::count();
+    #[cfg(not(feature = "nvk"))]
+    0
+}
+
+/// Notes a step of `ticks` that began with `serving` and overlapped
+/// `shot` shootdowns, when it is the longest since the last report.
+fn note_step(ticks: u64, shot: u64, serving: [u32; 4]) {
+    if PUMPS.step_longest.fetch_max(ticks, Ordering::Relaxed) < ticks {
+        PUMPS.step_shootdowns.store(shot, Ordering::Relaxed);
+        for (into, code) in PUMPS.step_serving.iter().zip(serving) {
+            into.store(code, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Since when the environment has had work ready, as a TSC value: events
+/// raised or its deadline passed.
+fn ready_since(gpu: &Installed, now: u64) -> Option<u64> {
+    let raised = gpu.events.pending.load(Ordering::Acquire).then(|| {
+        // An event raised as a pump cleared its time ages from here.
+        match PENDING_SINCE.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => now,
+            Err(since) => since.min(now),
+        }
+    });
+    let next = gpu.next.load(Ordering::Relaxed);
+    let due = (now >= next).then_some(next);
+    match (raised, due) {
+        (Some(raised), Some(due)) => Some(raised.min(due)),
+        (raised, due) => raised.or(due),
+    }
+}
+
+/// Opens the boot CPU's interrupt window, which a GPU's MSI needs: compiled
+/// code runs with interrupts off and a busy PE never waits. Taking one only
+/// records it, so this is cheap whatever the guest holds.
+pub(super) fn interrupt_window() {
+    if installed().is_some() {
+        native_irq::interrupt_window();
+    }
+}
+
+/// Whether the run loop pumps now, the boot PE being `calm`: at once when it
+/// holds no guest lock, and otherwise only once the ready work has waited
+/// [`DEFER_UNMASKED_NS`] with interrupts unmasked or [`DEFER_LONGEST_NS`]
+/// whatever it runs, so completions and posted calls are never starved
+/// ([`boot_decision`]). Work it holds back first wakes a PE whose guest
+/// waits, once for each episode, which pumps it at once: the boot PE pumps
+/// only what no such PE took.
+pub(super) fn pump_due(calm: Calm) -> bool {
+    let Some(gpu) = installed() else {
+        return false;
+    };
+    let now = host::rdtsc();
+    let Some(since) = ready_since(gpu, now) else {
+        return false;
+    };
+    let waited = now.saturating_sub(since);
+    let limits = Limits {
+        unmasked: gpu.tsc_after(DEFER_UNMASKED_NS),
+        longest: gpu.tsc_after(DEFER_LONGEST_NS),
+    };
+    let Some(why) = boot_decision(calm, waited, limits) else {
+        PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
+        // A Linux timer that came due raised no event, so nothing woke a
+        // sleeper for it yet. Not while a processor pumps: it runs the timer.
+        if may_move() && TURN.wake_due() && WAKES.first_for(since) && call_idle_core() {
+            PUMPS.woken.fetch_add(1, Ordering::Relaxed);
+        }
+        return false;
+    };
+    let counter = match why {
+        BootPump::Forced => &PUMPS.forced,
+        BootPump::Quiet => &PUMPS.quiet,
+        BootPump::Unmasked => &PUMPS.unmasked,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Whether a processor other than the boot CPU may run Linux in its place:
+/// with the GPUs' Metal service, until the GPUs' stop closes it
+/// ([`close_moves`]).
+fn may_move() -> bool {
+    cfg!(feature = "nvk") && !host::moves_closed()
+}
+
+/// Whether this is the boot CPU, which Linux lives on.
+fn on_boot_cpu() -> bool {
+    #[cfg(feature = "nvk")]
+    return host::processor() == BOOT_CPU.load(Ordering::Relaxed);
+    #[cfg(not(feature = "nvk"))]
+    true
+}
+
+/// This processor's index: the boot CPU's, without the Metal service.
+fn this_processor() -> u32 {
+    #[cfg(feature = "nvk")]
+    return host::processor();
+    #[cfg(not(feature = "nvk"))]
+    0
+}
+
+/// Has every later Linux entry run on the boot CPU, and waits for one in
+/// its place to leave, for the GPUs' stop: its work changes interrupt
+/// routes and unloads firmware, which the boot CPU owns.
+#[cfg(feature = "nvk")]
+pub(super) fn close_moves() {
+    let Some(gpu) = installed() else {
+        return;
+    };
+    if !host::close_moves(gpu.tsc_after(MOVES_CLOSE_NS)) {
+        output::arguments(format_args!(
+            "GPU stop: Linux still runs on another processor after {} ms\n",
+            MOVES_CLOSE_NS / 1_000_000
+        ));
+    }
+}
+
+/// Run what is ready in the environment from the boot PE's run loop:
+/// between its slices once [`pump_due`], or while it waits for the
+/// service's turn.
+pub(super) fn pump() {
+    pump_as(Taker::Boot, &|| false);
+}
+
+/// Run what is ready from the idle service of a PE whose guest waits for an
+/// interrupt, on its own core, within [`WAITING_PUMP_NS`] and only until its
+/// guest has work (`guest_work`). Nothing with no work ready, or while the
+/// GPUs stop.
+pub(super) fn pump_waiting_pe(guest_work: &dyn Fn() -> bool) {
+    if on_boot_cpu() || !may_move() {
+        return;
+    }
+    if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
+        pump_as(Taker::Waiting, guest_work);
+    }
+}
+
+/// One pump by `taker` on this processor, under the [`TURN`]: what was
+/// raised and Linux's due timers, its steps until nothing runs, the budget
+/// ends, another core wants the host drivers or, off the boot CPU,
+/// `guest_work` says this PE's guest has work. A processor that finds the
+/// turn or the host drivers' lock taken leaves the work pending for the one
+/// that has it, or for the boot PE's fallback.
+fn pump_as(taker: Taker, guest_work: &dyn Fn() -> bool) {
+    let Some(gpu) = installed() else {
+        return;
+    };
+    let boot = on_boot_cpu();
+    if boot {
+        native_irq::interrupt_window();
+    }
+    let Some(since) = ready_since(gpu, host::rdtsc()) else {
+        return;
+    };
+    let Some(turn) = TURN.try_take(this_processor()) else {
+        PUMPS.turn_busy.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let entered = host::rdtsc();
+    let budget = gpu.tsc_after(if boot { PUMP_NS } else { WAITING_PUMP_NS });
+    let mut steps = 0u32;
+    let mut started = entered;
+    let mut part_at = entered;
+    let mut lap = |part: PumpPart| {
+        let now = host::rdtsc();
+        part.add(now.wrapping_sub(part_at));
+        part_at = now;
+    };
+    let body = |runtime: Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>| {
+        lap(PumpPart::Enter);
+        // Taken here, inside: a pump that could not enter leaves the work
+        // pending with its age. Cleared before the flag: an event raised
+        // between the two stores its own time once the flag is clear.
+        started = host::rdtsc();
+        PENDING_SINCE.store(0, Ordering::Release);
+        let raised = gpu.events.pending.swap(false, Ordering::AcqRel);
+        let delay = started.saturating_sub(since);
+        PUMPS.delay.fetch_add(delay, Ordering::Relaxed);
+        PUMPS.delay_longest.fetch_max(delay, Ordering::Relaxed);
+        PUMPS.by_taker[taker as usize].fetch_add(1, Ordering::Relaxed);
+        if let Some(index) = match taker {
+            Taker::Boot => Some(0),
+            Taker::Waiting => Some(1),
+            Taker::Poster => None,
+        } {
+            PUMPS.taker_delay[index].fetch_add(delay, Ordering::Relaxed);
+            PUMPS.taker_delay_longest[index].fetch_max(delay, Ordering::Relaxed);
+        }
+        let cause = if raised {
+            &PUMPS.by_event
+        } else {
+            &PUMPS.by_deadline
+        };
+        cause.fetch_add(1, Ordering::Relaxed);
+        let mut first = true;
+        loop {
+            // What is raised from here on this pass takes: the step runs
+            // the tasks it woke, and `client::start` the calls posted. Only
+            // what comes after stays pending for the next pump, which does
+            // not then run for nothing.
+            if !first {
+                PENDING_SINCE.store(0, Ordering::Release);
+                gpu.events.pending.store(false, Ordering::Release);
+            }
+            // Tasks retire and calls arrive only through steps and posts:
+            // a pump's first pass looks only if something may have.
+            #[cfg(feature = "nvk")]
+            if !first || client::start_due() {
+                gpu.advance_children();
+                client::start(gpu)?;
+            }
+            #[cfg(not(feature = "nvk"))]
+            gpu.advance_children();
+            first = false;
+            lap(PumpPart::Children);
+            #[cfg(feature = "nvk")]
+            let serving = client::serving();
+            #[cfg(not(feature = "nvk"))]
+            let serving = [0; 4];
+            let (step_started, shot) = (host::rdtsc(), shootdowns());
+            let stepped = runtime.step()?;
+            lap(PumpPart::Steps);
+            if !stepped {
+                break;
+            }
+            let now_shot = shootdowns();
+            note_step(
+                host::rdtsc().wrapping_sub(step_started),
+                now_shot.checked_sub(shot).unwrap_or(now_shot),
+                serving,
+            );
+            steps += 1;
+            // A core spinning for the host drivers' lock this pump holds
+            // (a disk or input call) takes it after this step; the rest
+            // stays pending for the next pump. So does it once this PE's
+            // guest has work, off the boot CPU.
+            if super::service::shutdown_pending()
+                || host::rdtsc().wrapping_sub(started) >= budget
+                || super::storage::host_drivers_wanted()
+                || (!boot && guest_work())
+            {
+                if !gpu.events.pending.swap(true, Ordering::AcqRel) {
+                    PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
+                }
+                break;
+            }
+        }
+        let next = match gpu.domain.next_deadline()? {
+            Some(next) => {
+                let left = next.saturating_sub(gpu.time.now_ns()?);
+                host::rdtsc().saturating_add(gpu.tsc_after(left))
+            }
+            None => u64::MAX,
+        };
+        gpu.next.store(next, Ordering::Relaxed);
+        Ok(())
+    };
+    // A waiting PE waits briefly for the lock: a poster running Linux for
+    // its own call lets go at its next step once a core waits.
+    let ran = if boot {
+        Some(gpu.work.dispatch_linux(body))
+    } else {
+        gpu.work.dispatch_linux_moved(MOVED_LOCK_WAIT_MICROS, body)
+    };
+    match ran {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            output::fatal(format_args!("the host's Linux environment failed: {error}"))
+        }
+        None => {
+            // The host drivers' lock was taken: whoever holds it runs Linux
+            // or a driver, and the work stays pending for the next pump.
+            PUMPS.turn_busy.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    lap(PumpPart::Leave);
+    if steps == 0 {
+        PUMPS.idle.fetch_add(1, Ordering::Relaxed);
+    }
+    PUMPS.steps.fetch_add(u64::from(steps), Ordering::Relaxed);
+    // The turn goes before the look, which may wait for Linux: for a call
+    // it posts, which off the boot CPU this processor runs Linux for
+    // itself (`serve_posted`), or for a lock of Mesa's a job holds while
+    // its own posted call waits for a pump, which the wait runs on this
+    // processor (`gate::relax`). Kept, every pump found the turn taken
+    // until the call was withdrawn. Work raised while it was held called
+    // no core ([`call_for_work`]), so one is called for it now.
+    if turn.release(|| gpu.events.pending.load(Ordering::Acquire)) {
+        call_for_work();
+    }
+    #[cfg(feature = "nvk")]
+    match look_due(gpu) {
+        Look::Device => {
+            gate::interrupted();
+            gate::watch_completions();
+        }
+        Look::Waiters => gate::watch_completions(),
+        Look::No => {}
+    }
+    // A lost GPU that did not reopen, with no other to serve macOS.
+    #[cfg(feature = "nvk")]
+    gate::watch_losses();
+    lap(PumpPart::Look);
+    // The pipelines the device added go to the store's file, queued a
+    // piece at a time, from the boot CPU.
+    #[cfg(feature = "nvk")]
+    if boot {
+        super::pipelines::step();
+    }
+    let took = host::rdtsc().wrapping_sub(entered);
+    PUMPS.ticks.fetch_add(took, Ordering::Relaxed);
+    PUMPS.longest.fetch_max(took, Ordering::Relaxed);
+}
+
+/// Run Linux on this processor, not the boot CPU, for a call it posted and
+/// waits for (`client::spin`), while `waiting`: in the boot CPU's place, as
+/// the boot CPU would in its run loop, for [`POSTER_PUMP_NS`] at most or
+/// until nothing runs. `None` when it did not enter: with the host drivers'
+/// lock taken, or where it does not serve its own calls
+/// ([`serves_own_posts`]), the caller spins. Otherwise whether a step ran:
+/// with none, the caller waits for an event or a due timer
+/// ([`posted_work_ready`]) before it enters again.
+#[cfg(feature = "nvk")]
+fn serve_posted(gpu: &Installed, waiting: &dyn Fn() -> bool) -> Option<bool> {
+    if !serves_own_posts() {
+        return None;
+    }
+    let started = host::rdtsc();
+    let budget = gpu.tsc_after(POSTER_PUMP_NS);
+    let mut stepped = false;
+    let ran = gpu.work.dispatch_linux_moved(0, |runtime| {
+        PUMPS.by_taker[Taker::Poster as usize].fetch_add(1, Ordering::Relaxed);
+        while waiting() {
+            gpu.advance_children();
+            client::start(gpu)?;
+            if !waiting() || !runtime.step()? {
+                break;
+            }
+            stepped = true;
+            client::children_stale();
+            if host::rdtsc().wrapping_sub(started) >= budget
+                || super::storage::host_drivers_wanted()
+            {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    if let Err(error) = ran {
+        output::fatal(format_args!("the host's Linux environment failed: {error}"));
+    }
+    Some(stepped)
+}
+
+/// How long a poster that found nothing to run ([`serve_posted`]) spins
+/// before it enters again: with work raised or due, which the processor it
+/// woke may be taking, and without, for a call no other processor took.
+#[cfg(feature = "nvk")]
+const POSTER_READY_NS: u64 = 20_000;
+#[cfg(feature = "nvk")]
+const POSTER_RECHECK_NS: u64 = 100_000;
+
+/// Whether a poster that found nothing to run when it left at `since`
+/// enters again ([`POSTER_READY_NS`], [`POSTER_RECHECK_NS`]).
+#[cfg(feature = "nvk")]
+fn posted_work_ready(gpu: &Installed, since: u64) -> bool {
+    let now = host::rdtsc();
+    let idle = now.wrapping_sub(since);
+    idle >= gpu.tsc_after(POSTER_RECHECK_NS)
+        || (idle >= gpu.tsc_after(POSTER_READY_NS) && ready_since(gpu, now).is_some())
+}
+
+/// Whether this processor runs Linux itself for the calls it posts
+/// ([`serve_posted`]), so that none needs waking for them: a processor
+/// other than the boot CPU, outside a job's slice and an interrupt handler,
+/// while the GPUs do not stop.
+#[cfg(feature = "nvk")]
+fn serves_own_posts() -> bool {
+    host::processor() != BOOT_CPU.load(Ordering::Relaxed)
+        && may_move()
+        && !slice::in_job()
+        && !host::in_interrupt()
+}
+
+/// A pump for a posted call, from host work on the boot CPU that can run
+/// for milliseconds between the run loop's pumps (the host service's device
+/// polls): an AP waiting for a DRM call waits for the boot CPU, not for that
+/// work. Nothing runs elsewhere, or with no call posted.
+pub(super) fn pump_posted() {
+    #[cfg(feature = "nvk")]
+    if client::posted_waiting() && host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
+        PUMPS.posted.fetch_add(1, Ordering::Relaxed);
+        let started = host::rdtsc();
+        pump();
+        POSTED_TICKS.fetch_add(host::rdtsc().wrapping_sub(started), Ordering::Relaxed);
+    }
+}
+
+/// A pump from a wait for the service's turn on the boot CPU, which runs no
+/// guest code meanwhile.
+#[cfg(feature = "nvk")]
+fn pump_waiting() {
+    if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
+        PUMPS.relaxed.fetch_add(1, Ordering::Relaxed);
+    }
+    pump();
+}
+
+/// `GPU PUMP runs=… quiet=… unmasked=… forced=… relaxed=… posted=… by_event=…
+/// by_deadline=… idle=… deferred=… mean_us=… longest_us=… delay_mean_us=…
+/// delay_longest_us=… next_us=… next_timer=…`: the pumps since the last
+/// report, by what let each run and why it was due, what they took, how long
+/// ready work waited for one, and Linux's next deadline with the function
+/// of its first timer-list timer, as an offset in this image. Then
+/// `step_longest_us=… step_shootdowns=… step_serving=…`: the longest single
+/// Linux step, the shootdowns during it and the posted calls being performed
+/// as it began (`-` for none), and `unmaps=device/pages/files/stacks`
+/// ([`UNMAPS`]). Then `by_boot=… by_waiting=… by_poster=… woken=…
+/// turn_busy=… wakes_held=… boot_delay_mean_us=… boot_delay_longest_us=…
+/// waiting_delay_mean_us=… waiting_delay_longest_us=…`: who ran Linux
+/// ([`Taker`]: the boot PE's pumps, pumps on PEs whose guest waits, and runs
+/// of PEs for their own posted calls), the sleeping PEs woken for work, the
+/// pumps not run as another processor held the turn or the host drivers'
+/// lock, the calls for work not made as a processor held the turn, and how
+/// long ready work waited for the boot PE's pumps and the
+/// waiting PEs'. And `total_us=enter/children/steps/leave/look:…` the
+/// pumps' time by [`PumpPart`], then `part_longest_us=…` the longest each
+/// part took in one pump. Then `\nGPU LINUX timers=… works=… sleepers=… timeouts=…
+/// steps=…` ([`linux_report`]).
+pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
+    let gpu = installed()?;
+    let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+    let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
+    let (by_event, by_deadline) = (take(&PUMPS.by_event), take(&PUMPS.by_deadline));
+    let runs = by_event + by_deadline;
+    let (ticks, delay) = (take(&PUMPS.ticks), take(&PUMPS.delay));
+    let next = gpu.next.load(Ordering::Relaxed);
+    let next_us = match next {
+        u64::MAX => -1,
+        next => micros(next.saturating_sub(host::rdtsc())) as i128,
+    };
+    let mut serving = String::new();
+    for code in &PUMPS.step_serving {
+        let code = code.swap(0, Ordering::Relaxed);
+        if code != 0 {
+            if !serving.is_empty() {
+                serving.push('+');
+            }
+            serving.push_str(&format!("{:#x}", code.wrapping_sub(1)));
+        }
+    }
+    if serving.is_empty() {
+        serving.push('-');
+    }
+    let [device, pages, files, stacks] = UNMAPS.each_ref().map(take);
+    let boot = take(&PUMPS.by_taker[Taker::Boot as usize]);
+    let waiting = take(&PUMPS.by_taker[Taker::Waiting as usize]);
+    #[cfg(feature = "nvk")]
+    let nvkm = nvkm_report() + &perf_report();
+    #[cfg(not(feature = "nvk"))]
+    let nvkm = String::new();
+    let pumps = format!(
+        "GPU PUMP runs={runs} quiet={} unmasked={} forced={} relaxed={} posted={} by_event={by_event} \
+         by_deadline={by_deadline} idle={} deferred={} mean_us={} longest_us={} \
+         delay_mean_us={} delay_longest_us={} next_us={next_us} next_timer={} \
+         step_longest_us={} step_shootdowns={} step_serving={serving} \
+         unmaps={device}/{pages}/{files}/{stacks} by_boot={boot} by_waiting={waiting} \
+         by_poster={} woken={} turn_busy={} wakes_held={} boot_delay_mean_us={} boot_delay_longest_us={} \
+         waiting_delay_mean_us={} waiting_delay_longest_us={}",
+        take(&PUMPS.quiet),
+        take(&PUMPS.unmasked),
+        take(&PUMPS.forced),
+        take(&PUMPS.relaxed),
+        take(&PUMPS.posted),
+        take(&PUMPS.idle),
+        take(&PUMPS.deferred),
+        micros(ticks.checked_div(runs).unwrap_or(0)),
+        micros(take(&PUMPS.longest)),
+        micros(delay.checked_div(runs).unwrap_or(0)),
+        micros(take(&PUMPS.delay_longest)),
+        next_timer(),
+        micros(take(&PUMPS.step_longest)),
+        take(&PUMPS.step_shootdowns),
+        take(&PUMPS.by_taker[Taker::Poster as usize]),
+        take(&PUMPS.woken),
+        take(&PUMPS.turn_busy),
+        take(&PUMPS.wakes_held),
+        micros(take(&PUMPS.taker_delay[0]).checked_div(boot).unwrap_or(0)),
+        micros(take(&PUMPS.taker_delay_longest[0])),
+        micros(
+            take(&PUMPS.taker_delay[1])
+                .checked_div(waiting)
+                .unwrap_or(0)
+        ),
+        micros(take(&PUMPS.taker_delay_longest[1])),
+    );
+    // Each part's total over the pumps since the last report.
+    let parts: Vec<String> = PUMPS
+        .parts
+        .iter()
+        .map(|part| format!("{}", micros(take(part))))
+        .collect();
+    let longest: Vec<String> = PUMPS
+        .part_longest
+        .iter()
+        .map(|part| format!("{}", micros(take(part))))
+        .collect();
+    let pumps = format!(
+        "{pumps} total_us={names}/{} part_longest_us={names}/{}",
+        parts.join("/"),
+        longest.join("/"),
+        names = PumpPart::NAMES.join("/"),
+    );
+    let linux = linux_report(take(&PUMPS.steps), tsc_hz);
+    Some(pumps + &linux + &nvkm)
+}
+
+/// `compat/stela/counts.h`: `struct stela_linux_count_kind`.
+#[repr(C)]
+struct LinuxCountKind {
+    /// Per slot the function and its count.
+    slots: [[AtomicUsize; 2]; 32],
+    other: AtomicUsize,
+}
+
+/// `compat/stela/counts.h`: `struct stela_linux_counts`.
+#[repr(C)]
+struct LinuxCounts {
+    timers: LinuxCountKind,
+    works: LinuxCountKind,
+    sleepers: LinuxCountKind,
+    timeouts: AtomicUsize,
+}
+
+/// `\nGPU LINUX timers=+0x…:N,… works=… sleepers=… timeouts=N steps=N`:
+/// since the last report, the timer callbacks (timer-list and
+/// high-resolution) and work items that ran in the environment, most first,
+/// by function as an offset in this image (`other:N` for the rest), the tasks
+/// a timeout woke by the work item or thread function they ran (`-` for
+/// neither) and in all, and the Linux steps the pumps ran. Then
+/// `step_us=select/body/after empty_us=N empties=N scans=N locks=N clocks=N`:
+/// the work dispatchers' time (all runtimes) in steps that ran a task (entry to the switch, the
+/// task's run, return to exit), its time and count of steps that found
+/// nothing, its job-slot scans for idle tasks, its queue locks, and the
+/// native clock's samples.
+fn linux_report(steps: u64, tsc_hz: u64) -> String {
+    /// Functions listed per kind.
+    const TOP: usize = 4;
+    unsafe extern "C" {
+        /// `compat/kernel/counts.c`, which updates it only atomically.
+        static stela_linux_counts: LinuxCounts;
+        static __ImageBase: u8;
+    }
+    // SAFETY: counters the environment updates only atomically.
+    let counts = unsafe { &stela_linux_counts };
+    let base = &raw const __ImageBase as usize;
+    let list = |kind: &LinuxCountKind| {
+        let mut taken: Vec<(usize, usize)> = kind
+            .slots
+            .iter()
+            .filter_map(|[function, count]| {
+                let count = count.swap(0, Ordering::Relaxed);
+                (count != 0).then(|| (function.load(Ordering::Relaxed), count))
+            })
+            .collect();
+        taken.sort_unstable_by_key(|&(_, count)| core::cmp::Reverse(count));
+        let other = kind.other.swap(0, Ordering::Relaxed)
+            + taken
+                .iter()
+                .skip(TOP)
+                .map(|&(_, count)| count)
+                .sum::<usize>();
+        let mut line = String::new();
+        for &(function, count) in taken.iter().take(TOP) {
+            if !line.is_empty() {
+                line.push(',');
+            }
+            match function {
+                // The counters' mark for no function.
+                1 => line.push_str(&format!("-:{count}")),
+                function => line.push_str(&format!("+{:#x}:{count}", function.wrapping_sub(base))),
+            }
+        }
+        if other != 0 {
+            if !line.is_empty() {
+                line.push(',');
+            }
+            line.push_str(&format!("other:{other}"));
+        }
+        if line.is_empty() {
+            line.push('-');
+        }
+        line
+    };
+    let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
+    let step = stela_drivers::platform::work::step_counts::take();
+    format!(
+        "\nGPU LINUX timers={} works={} sleepers={} timeouts={} steps={steps} \
+         step_us={}/{}/{} empty_us={} empties={} scans={} locks={} clocks={}",
+        list(&counts.timers),
+        list(&counts.works),
+        list(&counts.sleepers),
+        counts.timeouts.swap(0, Ordering::Relaxed),
+        micros(step.select),
+        micros(step.body),
+        micros(step.after),
+        micros(step.empty),
+        step.empty_steps,
+        step.scans,
+        step.locks,
+        crate::native_clock::SAMPLES.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// `\nGPU NVKM kind:count/total_us/longest_us …`: where nouveau's page-table
+/// and instance-memory paths spent their time since the last report
+/// (`include/nvkm/core/counts.h`), for kinds that ran, then
+/// `\nGPU NVKM SIZES kind:count/total_kib/largest_kib …` for its page-table
+/// references by page size and its sparse references. Empty when none ran.
+#[cfg(feature = "nvk")]
+fn nvkm_report() -> String {
+    /// `enum nvkm_count`'s kinds, in order.
+    const KINDS: [&str; 12] = [
+        "flush",
+        "pt_new",
+        "pt_cached",
+        "pt_free",
+        "kmap",
+        "evict",
+        "kmap_slow",
+        "rpc",
+        "get_4k",
+        "get_64k",
+        "get_2m",
+        "sparse",
+    ];
+    /// The first kind that counts bytes, not nanoseconds.
+    const SIZES: usize = 8;
+    unsafe extern "C" {
+        /// `nvkm/subdev/mmu/base.c`: per kind a count, nanoseconds (or
+        /// bytes) and the longest (or largest), which nvkm updates
+        /// atomically.
+        static nvkm_counts: [[AtomicU64; 3]; 12];
+    }
+    let mut times = String::new();
+    let mut sizes = String::new();
+    // SAFETY: nvkm's static counters, which it only updates atomically.
+    let counts = unsafe { &nvkm_counts };
+    for (index, (kind, [count, total, longest])) in KINDS.iter().zip(counts).enumerate() {
+        let count = count.swap(0, Ordering::Relaxed);
+        let total = total.swap(0, Ordering::Relaxed);
+        let longest = longest.swap(0, Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        let (line, head, unit) = if index < SIZES {
+            (
+                &mut times,
+                "\nGPU NVKM kind:count/total_us/longest_us",
+                1000,
+            )
+        } else {
+            (
+                &mut sizes,
+                "\nGPU NVKM SIZES kind:count/total_kib/largest_kib",
+                1024,
+            )
+        };
+        if line.is_empty() {
+            line.push_str(head);
+        }
+        line.push_str(&format!(
+            " {kind}:{count}/{}/{}",
+            total / unit,
+            longest / unit
+        ));
+    }
+    times + &sizes
+}
+
+/// `\nGPU PERF pstate=… seen=… pcie=… rounds=…`: the GPU's P-state as GSP-RM
+/// reported it and its PCIe link since the last report
+/// (`stela_drivers::gpu::gsp_perf`), at the first report after GSP starts and
+/// then when they changed. Empty otherwise.
+#[cfg(feature = "nvk")]
+fn perf_report() -> String {
+    use stela_drivers::gpu::gsp_perf::{Report, Reported};
+    unsafe extern "C" {
+        /// `nvkm/subdev/gsp/rm/r535/perf.c`, which nouveau updates only
+        /// atomically.
+        static nvkm_perf: Report;
+    }
+    static REPORTED: Reported = Reported::new();
+    // SAFETY: nouveau's static report, which it only updates atomically.
+    let report = unsafe { &nvkm_perf };
+    report
+        .take()
+        .and_then(|taken| REPORTED.line(&taken))
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default()
+}
+
+/// The function of the timer-list timer due first when Linux last looked,
+/// as an offset in this image, or `-` for none.
+fn next_timer() -> String {
+    unsafe extern "C" {
+        /// `compat/kernel/timer.c`: the first pending timer's function.
+        static stela_linux_timer_next_function: AtomicUsize;
+        static __ImageBase: u8;
+    }
+    // SAFETY: a word the environment stores whenever it reads its queue.
+    let function = unsafe { stela_linux_timer_next_function.load(Ordering::Relaxed) };
+    if function == 0 {
+        return String::from("-");
+    }
+    let base = &raw const __ImageBase as usize;
+    format!("+{:#x}", function.wrapping_sub(base))
+}
+
+#[cfg(feature = "nvk")]
+/// The GPU interrupts taken when the Metal services last looked for
+/// completed work.
+static LOOKED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "nvk")]
+/// A service a call held asked to look again.
+static LOOK: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "nvk")]
+/// When a pump next looks though nothing asked, as a TSC value.
+static NEXT_LOOK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "nvk")]
+/// How long a pump goes without looking when the GPU has not interrupted: a
+/// fence Linux signals outside its interrupt, as a submission or a job's
+/// timeout may, is seen within this.
+const LOOK_FALLBACK_NS: u64 = 10_000_000;
+
+#[cfg(feature = "nvk")]
+/// What a pump looks at after its steps ([`look_due`]).
+enum Look {
+    /// Each GPU's completion, which enters the driver, and the devices'
+    /// new completion timelines.
+    Device,
+    /// Only the devices' new completion timelines, which need no driver.
+    Waiters,
+    No,
+}
+
+#[cfg(feature = "nvk")]
+/// What this pump looks at: each look asks the driver for each GPU's
+/// completion, which only an interrupt or a waiter's point makes likely to
+/// have moved. Most pumps run for a call a PE posted or a Linux timer. The
+/// fallback look every [`LOOK_FALLBACK_NS`] is for a device no waiter
+/// watches: while one waits on the only device's timeline, every fence it
+/// signals reaches the waiter, which asks for the look itself, so while
+/// every device's waiter waits the fallback only starts the waiters of new
+/// timelines.
+fn look_due(gpu: &Installed) -> Look {
+    let fired = FIRED.load(Ordering::Acquire);
+    let interrupted = LOOKED.swap(fired, Ordering::Relaxed) != fired;
+    let asked = LOOK.swap(false, Ordering::AcqRel);
+    let now = host::rdtsc();
+    let fallback = now >= NEXT_LOOK.load(Ordering::Relaxed);
+    if interrupted || asked || fallback {
+        NEXT_LOOK.store(
+            now.saturating_add(gpu.tsc_after(LOOK_FALLBACK_NS)),
+            Ordering::Relaxed,
+        );
+    }
+    if interrupted || asked {
+        Look::Device
+    } else if !fallback {
+        Look::No
+    } else if waiter::watching(gate::shared().len()) {
+        Look::Waiters
+    } else {
+        Look::Device
+    }
+}
+
+#[cfg(feature = "nvk")]
+/// Pumps the service again soon, from any processor, and has that pump look
+/// for completed work.
+fn look_again() {
+    LOOK.store(true, Ordering::Release);
+    if let Some(gpu) = installed() {
+        // This raises a flag and calls the boot PE, so it cannot fail.
+        let _ = gpu.events.notify();
+    }
+}
+
+/// `ticks` of the host counter, cut short to end at Linux's next deadline,
+/// or, while work is ready but held back for a calmer boot PE, when the
+/// run loop next looks whether to pump ([`pump_due`]).
+pub(super) fn slice(ticks: u64) -> u64 {
+    let Some(gpu) = installed() else {
+        return ticks;
+    };
+    let now = host::rdtsc();
+    let end = match ready_since(gpu, now) {
+        Some(since) => {
+            let unmasked = since.saturating_add(gpu.tsc_after(DEFER_UNMASKED_NS));
+            let longest = since.saturating_add(gpu.tsc_after(DEFER_LONGEST_NS));
+            // Every recheck, so that a boot PE that reaches EL0 or waits
+            // for an interrupt (calm, `pump_due`) pumps then rather than at
+            // the unmasked deadline: a submission or completion waits a
+            // quarter of a millisecond for a calm moment, not the whole one.
+            let recheck = now.saturating_add(gpu.tsc_after(RECHECK_NS));
+            if now < unmasked {
+                recheck.min(unmasked)
+            } else {
+                recheck.min(longest)
+            }
+        }
+        None => gpu.next.load(Ordering::Relaxed),
+    };
+    let left = end.saturating_sub(now);
+    let left = u128::from(left) * u128::from(host::COUNTER_HZ) / u128::from(gpu.tsc_hz.max(1));
+    ticks.min(left.min(u128::from(u64::MAX)) as u64).max(1)
+}

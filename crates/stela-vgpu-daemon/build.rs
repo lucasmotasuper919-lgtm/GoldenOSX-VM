@@ -1,0 +1,41 @@
+fn main() {
+    let root = "/home/lucas/.gemini/antigravity/scratch/stela-mod";
+    let comp = format!("{root}/target/vgpu-compiler");
+    let mesa = format!("{root}/target/vgpu-mesa");
+
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/targets/lavapipe/libvulkan_lvp.so.p/lavapipe_target.c.o");
+    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/frontends/lavapipe/liblavapipe_st.a");
+    println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+    println!("cargo:rustc-link-arg={comp}/libstela_metal_compiler.a");
+    println!("cargo:rustc-link-arg={comp}/libstela_lvp_bridge.a");
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/auxiliary/pipe-loader/libpipe_loader_static.a");
+    println!("cargo:rustc-link-arg={mesa}/src/loader/libloader.a");
+    println!("cargo:rustc-link-arg={mesa}/src/util/libmesa_util.a");
+    println!("cargo:rustc-link-arg={mesa}/src/util/libmesa_util_clflush.a");
+    println!("cargo:rustc-link-arg={mesa}/src/util/libmesa_util_clflushopt.a");
+    println!("cargo:rustc-link-arg={mesa}/src/util/libmesa_util_simd.a");
+    println!("cargo:rustc-link-arg={mesa}/src/util/blake3/libblake3.a");
+    println!("cargo:rustc-link-arg={mesa}/src/c11/impl/libmesa_util_c11.a");
+    println!("cargo:rustc-link-arg={mesa}/src/util/libxmlconfig.a");
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/auxiliary/libgallium.a");
+    println!("cargo:rustc-link-arg={mesa}/src/compiler/nir/libnir.a");
+    println!("cargo:rustc-link-arg={mesa}/src/compiler/libcompiler.a");
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/winsys/sw/wrapper/libwsw.a");
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/winsys/sw/null/libws_null.a");
+    println!("cargo:rustc-link-arg={mesa}/src/gallium/drivers/llvmpipe/libllvmpipe.a");
+    println!("cargo:rustc-link-arg={mesa}/src/vulkan/util/libvulkan_util.a");
+    println!("cargo:rustc-link-arg={mesa}/src/compiler/spirv/libvtn.a");
+    println!("cargo:rustc-link-arg=-L/usr/lib/llvm-21/lib");
+    println!("cargo:rustc-link-arg=-lLLVM-21");
+    println!("cargo:rustc-link-arg=-ldrm");
+    println!("cargo:rustc-link-arg=-ludev");
+    println!("cargo:rustc-link-arg=-lz");
+    println!("cargo:rustc-link-arg=-lm");
+    println!("cargo:rustc-link-arg=-ldl");
+    println!("cargo:rustc-link-arg=-lpthread");
+    println!("cargo:rustc-link-arg=-lstdc++");
+    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/llvm-21/lib");
+}

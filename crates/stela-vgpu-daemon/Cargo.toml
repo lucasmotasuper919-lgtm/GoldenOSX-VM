@@ -1,0 +1,12 @@
+[package]
+name = "stela-vgpu-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+stela-contracts = { path = "../stela-contracts", features = ["std"] }
+stela-driver-gpu = { path = "../stela-driver-gpu", features = ["metal-vulkan"] }
+ash = { version = "0.38", default-features = false }
+libc = "0.2"
