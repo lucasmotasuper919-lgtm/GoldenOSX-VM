@@ -69,7 +69,7 @@ if [ "$NPROC" -ge 4 ]; then
 else
     QEMU_SMP="${NPROC},cores=${NPROC},threads=1"
 fi
-LP_THREADS="$NPROC"
+LP_THREADS=$(( NPROC > 2 ? NPROC - 1 : NPROC ))
 [ "$LP_THREADS" -gt 8 ] && LP_THREADS=8
 
 export LD_LIBRARY_PATH="/opt/goldenosx/lib:${LD_LIBRARY_PATH:-}"
@@ -84,7 +84,7 @@ MESA_DISK_CACHE_SINGLE_FILE=true \
 MESA_SHADER_CACHE_DIR="$CACHE_BASE/mesa" \
 GALLIVM_PERF=nopt,brilinear,rho_approx \
 LP_NUM_THREADS="$LP_THREADS" \
-"$VGPU_BIN" >"$VGPU_LOG" 2>&1 &
+nice -n 10 "$VGPU_BIN" >"$VGPU_LOG" 2>&1 &
 VGPU_PID=$!
 
 for _ in $(seq 1 80); do
